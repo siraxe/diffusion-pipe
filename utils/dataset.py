@@ -419,6 +419,7 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
         directory_config.setdefault('num_repeats', dataset_config.get('num_repeats', 1))
+        directory_config.setdefault('skip_videos', dataset_config.get('skip_videos', False))
 
     def _metadata_map_fn(self):
         captions_file = self.path / 'captions.json'
@@ -477,6 +478,10 @@ class DirectoryDataset:
                 logger.warning(f'Media file {image_file} could not be opened. Skipping.')
                 return empty_return
             is_video = (frames > 1)
+            if self.directory_config['skip_videos'] and is_video:
+                logger.info(f'Skipping video file {image_file} due to skip_videos flag.')
+                return empty_return
+
             log_ar = np.log(width / height)
 
             if self.use_size_buckets:
