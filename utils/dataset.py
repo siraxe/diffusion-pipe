@@ -381,8 +381,8 @@ class DirectoryDataset:
                     'caption_content': caption_content # Store content to avoid re-reading
                 })
 
-            if not self.directory_config['skip_videos'] and not raw_metadata_list:
-                raise RuntimeError(f'Directory {self.path} had no images/videos and skip_videos is False!')
+            if not raw_metadata_list: # Removed skip_videos check
+                raise RuntimeError(f'Directory {self.path} had no images/videos!')
 
             # Create a temporary dataset to apply _metadata_map_fn
             temp_dataset = datasets.Dataset.from_list(raw_metadata_list)
@@ -458,7 +458,6 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
         directory_config.setdefault('num_repeats', dataset_config.get('num_repeats', 1))
-        directory_config.setdefault('skip_videos', dataset_config.get('skip_videos', False))
         directory_config.setdefault('force_cache_only', dataset_config.get('force_cache_only', False))
 
     def _metadata_map_fn(self):
@@ -518,9 +517,6 @@ class DirectoryDataset:
                 logger.warning(f'Media file {image_file} could not be opened. Skipping.')
                 return empty_return
             is_video = (frames > 1)
-            if self.directory_config['skip_videos'] and is_video:
-                logger.info(f'Skipping video file {image_file} due to skip_videos flag.')
-                return empty_return
 
             log_ar = np.log(width / height)
 
