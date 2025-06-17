@@ -272,8 +272,67 @@ if __name__ == '__main__':
     # Now initialize deepspeed
     deepspeed.init_distributed()
 
+    # Resolve relative paths in model config
+    for key, value in config['model'].items():
+        if isinstance(value, str) and not Path(value).is_absolute():
+            # Heuristic: if the value contains a path separator, treat it as a path
+            if '/' in value or '\\' in value:
+                resolved_path = Path(os.getcwd()) / value
+                config['model'][key] = str(resolved_path)
+                if is_main_process():
+                    print(f"Resolved relative path for config['model']['{key}']: {value} -> {resolved_path}")
+
     # needed for broadcasting Queue in dataset.py
     torch.cuda.set_device(dist.get_rank())
+
+    if 'ckpt_path' in config['model']:
+        print(f"Final ckpt_path: {config['model']['ckpt_path']}")
+    if 'path' in config['model']: # Assuming 'path' might be the key for the model directory
+        print(f"Final model base path (assuming 'path' key): {config['model']['path']}")
+
+    resume_from_checkpoint = (
+        args.resume_from_checkpoint if args.resume_from_checkpoint is not None
+        else config.get('resume_from_checkpoint', False)
+    )
+    regenerate_cache = (
+        args.regenerate_cache if args.regenerate_cache is not None
+        else config.get('regenerate_cache', False)
+    )
+    model_type = config['model']['type']
+
+    # if this is a new run, create a new dir for it
+    if not resume_from_checkpoint:
+        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+        os.makedirs(run_dir, exist_ok=True)
+        shutil.copy(args.config, run_dir)
+        shutil.copy(config['dataset'], run_dir)
+        for eval_dataset in config['eval_datasets']:
+            shutil.copy(eval_dataset['config'], run_dir)
+    # wait for all processes then get the most recent dir (may have just been created)
+    dist.barrier()
+    if resume_from_checkpoint is True:  # No specific folder provided, use most recent
+        run_dir = get_most_recent_run_dir(config['output_dir'])
+    elif isinstance(resume_from_checkpoint, str):  # Specific folder provided
+        run_dir = os.path.join(config['output_dir'], resume_from_checkpoint)
+        if not os.path.exists(run_dir):
+            raise ValueError(f"Checkpoint directory {run_dir} does not exist")
+    else:  # Not resuming, use most recent (newly created) dir
+        run_dir = get_most_recent_run_dir(config['output_dir'])
+
+    # WandB logging
+    wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
+    if wandb_enable:
+        wandb_api_key     = config['monitoring']['wandb_api_key']
+        wandb_tracker     = config['monitoring']['wandb_tracker_name']
+        wandb_run_name    = config['monitoring']['wandb_run_name']
+        logging_dir       = run_dir
+        wandb.login(key=wandb_api_key)
+        wandb.init(
+            project=wandb_tracker,
+            name=wandb_run_name,
+            config=config,
+            dir=logging_dir
+        )
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -441,39 +500,6 @@ if __name__ == '__main__':
     else:
         is_adapter = False
 
-    # if this is a new run, create a new dir for it
-    if not resume_from_checkpoint and is_main_process():
-        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
-        os.makedirs(run_dir, exist_ok=True)
-        shutil.copy(args.config, run_dir)
-        shutil.copy(config['dataset'], run_dir)
-        for eval_dataset in config['eval_datasets']:
-            shutil.copy(eval_dataset['config'], run_dir)
-    # wait for all processes then get the most recent dir (may have just been created)
-    dist.barrier()
-    if resume_from_checkpoint is True:  # No specific folder provided, use most recent
-        run_dir = get_most_recent_run_dir(config['output_dir'])
-    elif isinstance(resume_from_checkpoint, str):  # Specific folder provided
-        run_dir = os.path.join(config['output_dir'], resume_from_checkpoint)
-        if not os.path.exists(run_dir):
-            raise ValueError(f"Checkpoint directory {run_dir} does not exist")
-    else:  # Not resuming, use most recent (newly created) dir
-        run_dir = get_most_recent_run_dir(config['output_dir'])
-
-    # WandB logging
-    wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
-    if wandb_enable:
-        wandb_api_key     = config['monitoring']['wandb_api_key']
-        wandb_tracker     = config['monitoring']['wandb_tracker_name']
-        wandb_run_name    = config['monitoring']['wandb_run_name']
-        logging_dir       = run_dir
-        wandb.login(key=wandb_api_key)
-        wandb.init(
-            project=wandb_tracker,
-            name=wandb_run_name,
-            config=config,
-            dir=logging_dir
-        )
 
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
