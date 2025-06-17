@@ -20,7 +20,6 @@ import multiprocess as mp
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 
 
-DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
 NUM_PROC = min(8, os.cpu_count())
 
@@ -58,20 +57,29 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     return fn
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
     # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
     # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
-    new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
-    new_fingerprint_args.append(dataset._fingerprint)
-    new_fingerprint = Hasher.hash(new_fingerprint_args)
-    cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
+    if force_cache_only:
+        # If forcing cache only, use a fixed cache file name and bypass fingerprinting.
+        # This assumes the cache is always valid and present.
+        cache_file = cache_dir / f'{cache_file_prefix}fixed.arrow'
+        new_fingerprint = None # No fingerprinting
+        load_from_cache = True # Always try to load from this fixed cache
+    else:
+        new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
+        new_fingerprint_args.append(dataset._fingerprint)
+        new_fingerprint = Hasher.hash(new_fingerprint_args)
+        cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
+        load_from_cache = (not regenerate_cache)
+
     cache_file = str(cache_file)
     dataset = dataset.map(
         map_fn,
         cache_file_name=cache_file,
-        load_from_cache_file=(not regenerate_cache),
+        load_from_cache_file=load_from_cache,
         writer_batch_size=100,
-        new_fingerprint=new_fingerprint,
+        new_fingerprint=new_fingerprint, # Pass None if force_cache_only
         remove_columns=dataset.column_names,
         batched=True,
         batch_size=caching_batch_size,
@@ -92,7 +100,7 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_file_to_te_idx[image_file][caption_number]]
 
 
-def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size):
+def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size, force_cache_only=False):
 
     def flatten_captions(example):
         image_file_out, caption_out, is_video_out = [], [], []
@@ -112,6 +120,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         new_fingerprint_args=[i],
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
+        force_cache_only=force_cache_only, # Pass force_cache_only directly
     )
     return TextEmbeddingDataset(te_dataset)
 
@@ -133,7 +142,7 @@ class SizeBucketDataset:
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         print(f'caching latents: {self.size_bucket}')
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
@@ -142,6 +151,7 @@ class SizeBucketDataset:
             cache_file_prefix='latents_',
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
+            force_cache_only=force_cache_only,
         )
         iteration_order = []
         for example in self.latent_dataset.select_columns(['image_file', 'caption']):
@@ -172,8 +182,6 @@ class SizeBucketDataset:
         idx = idx % len(self.iteration_order)
         image_file, caption, caption_number = self.iteration_order[idx]
         ret = self.latent_dataset[self.image_file_to_latents_idx[image_file]]
-        if DEBUG:
-            print(Path(image_file).stem)
         offset = random.randrange(self.shuffle_skip)
         caption_idx = (caption_number*self.shuffle_skip) + offset
         for ds in self.text_embedding_datasets:
@@ -252,14 +260,14 @@ class ARBucketDataset:
     def get_size_bucket_datasets(self):
         return self.size_buckets
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         print(f'caching latents: {self.ar_frames}')
         for ds in self.size_buckets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         print(f'caching text embeddings: {self.ar_frames}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size, force_cache_only=force_cache_only)
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
@@ -330,52 +338,83 @@ class DirectoryDataset:
             quit()
 
     def cache_metadata(self, regenerate_cache=False):
-        files = list(self.path.glob('*'))
-        # deterministic order
-        files.sort()
+        metadata_json_path = self.cache_dir / 'metadata.json'
+        os.makedirs(self.cache_dir, exist_ok=True) # Ensure cache_dir exists for metadata.json
 
-        # Mask can have any extension, it just needs to have the same stem as the image.
-        mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
+        if self.directory_config['force_cache_only']:
+            if not metadata_json_path.exists():
+                raise RuntimeError(f"Metadata JSON file not found at {metadata_json_path}. Cannot proceed with force_cache_only=True.")
+            print(f'Loading metadata from JSON cache: {metadata_json_path}')
+            with open(metadata_json_path, 'r') as f:
+                metadata_list = json.load(f)
+            metadata_dataset = datasets.Dataset.from_list(metadata_list)
+        else:
+            files = list(self.path.glob('*'))
+            files.sort() # deterministic order
 
-        image_files = []
-        caption_files = []
-        mask_files = []
-        for file in files:
-            if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json':
-                continue
-            image_file = file
-            caption_file = image_file.with_suffix('.txt')
-            if not os.path.exists(caption_file):
-                caption_file = ''
-            image_files.append(str(image_file))
-            caption_files.append(str(caption_file))
-            if image_file.stem in mask_file_stems:
-                mask_files.append(str(mask_file_stems[image_file.stem]))
-            elif self.default_mask_file is not None:
-                mask_files.append(str(self.default_mask_file))
-            else:
-                if self.mask_path is not None:
-                    logger.warning(f'No mask file was found for image {image_file}, not using mask.')
-                mask_files.append(None)
-        assert len(image_files) > 0, f'Directory {self.path} had no images/videos!'
+            mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
 
-        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files, 'mask_file': mask_files})
+            raw_metadata_list = []
+            for file in files:
+                if not file.is_file() or file.suffix in ['.txt', '.npz', '.json']:
+                    continue
+                image_file = file
+                caption_file = image_file.with_suffix('.txt')
+                caption_content = ''
+                if os.path.exists(caption_file):
+                    with open(caption_file) as f:
+                        caption_content = f.read().strip()
+
+                mask_file = None
+                if image_file.stem in mask_file_stems:
+                    mask_file = str(mask_file_stems[image_file.stem])
+                elif self.default_mask_file is not None:
+                    mask_file = str(self.default_mask_file)
+                else:
+                    if self.mask_path is not None:
+                        logger.warning(f'No mask file was found for image {image_file}, not using mask.')
+
+                raw_metadata_list.append({
+                    'image_file': str(image_file),
+                    'caption_file': str(caption_file),
+                    'mask_file': mask_file,
+                    'caption_content': caption_content # Store content to avoid re-reading
+                })
+
+            if not self.directory_config['skip_videos'] and not raw_metadata_list:
+                raise RuntimeError(f'Directory {self.path} had no images/videos and skip_videos is False!')
+
+            # Create a temporary dataset to apply _metadata_map_fn
+            temp_dataset = datasets.Dataset.from_list(raw_metadata_list)
+            
+            # Apply _metadata_map_fn to get ar_bucket, size_bucket, is_video
+            metadata_map_fn = self._metadata_map_fn()
+            processed_metadata = temp_dataset.map(
+                metadata_map_fn,
+                batched=True,
+                batch_size=1, # Process one example at a time for metadata_map_fn
+                num_proc=NUM_PROC,
+                remove_columns=temp_dataset.column_names,
+            )
+            
+            # Filter out empty returns from metadata_map_fn (e.g., skipped videos)
+            # Ensure mask_file is kept, even if None, to maintain schema consistency.
+            metadata_list = [
+                example # Keep all keys, including mask_file if it's None
+                for example in processed_metadata if example['image_file'] # Filter out empty examples
+            ]
+
+            # Save to JSON
+            with open(metadata_json_path, 'w') as f:
+                json.dump(metadata_list, f, indent=4)
+            print(f'Saved metadata to JSON cache: {metadata_json_path}')
+
+            metadata_dataset = datasets.Dataset.from_list(metadata_list)
+
         # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
         # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
         seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
         metadata_dataset = metadata_dataset.shuffle(seed=seed)
-        metadata_map_fn = self._metadata_map_fn()
-        fingerprint = Hasher.hash([metadata_dataset._fingerprint, metadata_map_fn])
-        print('caching metadata')
-        metadata_dataset = metadata_dataset.map(
-            metadata_map_fn,
-            cache_file_name=str(self.cache_dir / f'metadata/metadata_{fingerprint}.arrow'),
-            load_from_cache_file=(not regenerate_cache),
-            batched=True,
-            batch_size=1,
-            num_proc=NUM_PROC,
-            remove_columns=metadata_dataset.column_names,
-        )
 
         grouped_metadata = defaultdict(lambda: defaultdict(list))
         for example in metadata_dataset:
@@ -420,6 +459,7 @@ class DirectoryDataset:
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
         directory_config.setdefault('num_repeats', dataset_config.get('num_repeats', 1))
         directory_config.setdefault('skip_videos', dataset_config.get('skip_videos', False))
+        directory_config.setdefault('force_cache_only', dataset_config.get('force_cache_only', False))
 
     def _metadata_map_fn(self):
         captions_file = self.path / 'captions.json'
@@ -573,17 +613,17 @@ class DirectoryDataset:
             result.extend(ar_bucket_dataset.get_size_bucket_datasets())
         return result
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         print(f'caching latents: {self.path}')
         datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         print(f'caching text embeddings: {self.path}')
         datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
 
 # Outermost dataset object that the caller uses. Contains multiple ConcatenatedBatchedDataset. Responsible
@@ -640,8 +680,6 @@ class Dataset:
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = iteration_order
-        if DEBUG:
-            print(f'Dataset iteration_order: {self.iteration_order}')
 
         self.post_init_called = True
 
@@ -662,8 +700,6 @@ class Dataset:
         examples = self.buckets[i][j]
         start_idx = self.data_parallel_rank*self.batch_size
         examples_for_this_dp_rank = examples[start_idx:start_idx+self.batch_size]
-        if DEBUG:
-            print((start_idx, start_idx+self.batch_size))
         batch = self._collate(examples_for_this_dp_rank)
         return batch
 
@@ -701,16 +737,16 @@ class Dataset:
         for ds in self.directory_datasets:
             ds.cache_metadata(regenerate_cache=regenerate_cache)
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         for ds in self.directory_datasets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         for ds in self.directory_datasets:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
 
-def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, caching_batch_size):
+def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, caching_batch_size, force_cache_only):
     # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
     # to avoid CPU contention.
     # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
@@ -728,7 +764,10 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         tensors_and_masks = []
         image_files = []
         captions = []
-        for path, mask_path, size_bucket, caption in zip(example['image_file'], example['mask_file'], example['size_bucket'], example['caption']):
+        # Ensure mask_file is handled correctly, even if None
+        mask_files = example.get('mask_file', [None] * len(example['image_file']))
+        
+        for path, mask_path, size_bucket, caption in zip(example['image_file'], mask_files, example['size_bucket'], example['caption']):
             assert size_bucket == first_size_bucket
             items = preprocess_media_file_fn(path, mask_path, size_bucket)
             tensors_and_masks.extend(items)
@@ -757,7 +796,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         return results
 
     for ds in datasets:
-        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example):
@@ -767,7 +806,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             result['image_file'] = example['image_file']
             return result
         for ds in datasets:
-            ds.cache_text_embeddings(text_embedding_map_fn, text_encoder_idx+1, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(text_embedding_map_fn, text_encoder_idx+1, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, force_cache_only=force_cache_only)
 
     # signal that we're done
     queue.put(None)
@@ -776,7 +815,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, model, regenerate_cache=False, caching_batch_size=1, force_cache_only=False):
         self.model = model
         self.vae = self.model.get_vae()
         self.text_encoders = self.model.get_text_encoders()
@@ -785,6 +824,7 @@ class DatasetManager:
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
+        self.force_cache_only = force_cache_only # New parameter
         self.datasets = []
 
     def register(self, dataset):
@@ -818,6 +858,7 @@ class DatasetManager:
                     len(self.text_encoders),
                     self.regenerate_cache,
                     self.caching_batch_size,
+                    self.force_cache_only, # Pass the new parameter
                 )
             )
             process.start()
@@ -848,10 +889,10 @@ class DatasetManager:
 
         # Now load all datasets from cache.
         for ds in self.datasets:
-            ds.cache_metadata()
-            ds.cache_latents(None)
+            ds.cache_metadata(regenerate_cache=self.regenerate_cache) # Ensure metadata also respects regenerate_cache
+            ds.cache_latents(None, regenerate_cache=self.regenerate_cache, force_cache_only=self.force_cache_only)
             for i in range(1, len(self.text_encoders)+1):
-                ds.cache_text_embeddings(None, i)
+                ds.cache_text_embeddings(None, i, regenerate_cache=self.regenerate_cache, force_cache_only=self.force_cache_only)
 
     @torch.no_grad()
     def _handle_task(self, task):
@@ -1063,7 +1104,6 @@ if __name__ == '__main__':
     common.zero_first = _zero_first
 
     from utils import dataset as dataset_util
-    dataset_util.DEBUG = True
 
     from models import flux
     model = flux.CustomFluxPipeline.from_pretrained('/data2/imagegen_models/FLUX.1-dev', torch_dtype=torch.bfloat16)
