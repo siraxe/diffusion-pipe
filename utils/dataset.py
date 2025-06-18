@@ -5,8 +5,6 @@ from collections import defaultdict
 import math
 import os
 import hashlib
-import json
-
 import numpy as np
 import torch
 from deepspeed.utils.logging import logger
@@ -16,6 +14,9 @@ from datasets.fingerprint import Hasher
 from PIL import Image
 import imageio
 import multiprocess as mp
+import pyarrow as pa
+import pyarrow.feather as feather
+import io
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 
@@ -338,16 +339,18 @@ class DirectoryDataset:
             quit()
 
     def cache_metadata(self, regenerate_cache=False):
-        metadata_json_path = self.cache_dir / 'metadata.json'
-        os.makedirs(self.cache_dir, exist_ok=True) # Ensure cache_dir exists for metadata.json
+        metadata_bin_path = self.cache_dir / 'metadata.bin'
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         if self.directory_config['force_cache_only']:
-            if not metadata_json_path.exists():
-                raise RuntimeError(f"Metadata JSON file not found at {metadata_json_path}. Cannot proceed with force_cache_only=True.")
-            print(f'Loading metadata from JSON cache: {metadata_json_path}')
-            with open(metadata_json_path, 'r') as f:
-                metadata_list = json.load(f)
-            metadata_dataset = datasets.Dataset.from_list(metadata_list)
+            if not metadata_bin_path.exists():
+                raise RuntimeError(f"Binary metadata cache not found at {metadata_bin_path}. Cannot proceed with force_cache_only=True.")
+            print(f'Loading binary metadata from cache: {metadata_bin_path}')
+            with open(metadata_bin_path, 'rb') as f:
+                data_bytes = f.read()
+            buffer = io.BytesIO(data_bytes)
+            pa_table = feather.read_table(buffer)
+            metadata_dataset = datasets.Dataset(pa_table)
         else:
             files = list(self.path.glob('*'))
             files.sort() # deterministic order
@@ -381,7 +384,7 @@ class DirectoryDataset:
                     'caption_content': caption_content # Store content to avoid re-reading
                 })
 
-            if not raw_metadata_list: # Removed skip_videos check
+            if not raw_metadata_list:
                 raise RuntimeError(f'Directory {self.path} had no images/videos!')
 
             # Create a temporary dataset to apply _metadata_map_fn
@@ -404,12 +407,17 @@ class DirectoryDataset:
                 for example in processed_metadata if example['image_file'] # Filter out empty examples
             ]
 
-            # Save to JSON
-            with open(metadata_json_path, 'w') as f:
-                json.dump(metadata_list, f, indent=4)
-            print(f'Saved metadata to JSON cache: {metadata_json_path}')
-
             metadata_dataset = datasets.Dataset.from_list(metadata_list)
+            
+            # Convert to pyarrow Table, serialize to bytes, and save
+            pa_table = metadata_dataset.data.table
+            buffer = io.BytesIO()
+            feather.write_feather(pa_table, buffer)
+            data_bytes = buffer.getvalue()
+            
+            with open(metadata_bin_path, 'wb') as f:
+                f.write(data_bytes)
+            print(f'Saved binary metadata to cache: {metadata_bin_path}')
 
         # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
         # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
@@ -1080,7 +1088,7 @@ class SkipFirstNSampler(torch.utils.data.Sampler):
     def __init__(self, n, dataset_length):
         super().__init__()
         self.n = n
-        self.dataset_length = dataset_length
+        self.dataset_length = dataset_length # Corrected line
 
     def __len__(self):
         return self.dataset_length
@@ -1088,33 +1096,3 @@ class SkipFirstNSampler(torch.utils.data.Sampler):
     def __iter__(self):
         for i in range(self.n, self.dataset_length):
             yield i
-
-
-if __name__ == '__main__':
-    from utils import common
-    common.is_main_process = lambda: True
-    from contextlib import contextmanager
-    @contextmanager
-    def _zero_first():
-        yield
-    common.zero_first = _zero_first
-
-    from utils import dataset as dataset_util
-
-    from models import flux
-    model = flux.CustomFluxPipeline.from_pretrained('/data2/imagegen_models/FLUX.1-dev', torch_dtype=torch.bfloat16)
-    model.model_config = {'guidance': 1.0, 'dtype': torch.bfloat16}
-
-    import toml
-    dataset_manager = dataset_util.DatasetManager(model)
-    with open('/home/anon/code/diffusion-pipe-configs/datasets/tiny1.toml') as f:
-        dataset_config = toml.load(f)
-    train_data = dataset_util.Dataset(dataset_config, model)
-    dataset_manager.register(train_data)
-    dataset_manager.cache()
-
-    train_data.post_init(data_parallel_rank=0, data_parallel_world_size=1, per_device_batch_size=1, gradient_accumulation_steps=2)
-    print(f'Dataset length: {len(train_data)}')
-
-    for item in train_data:
-        pass
