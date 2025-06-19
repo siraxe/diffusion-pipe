@@ -17,6 +17,7 @@ import multiprocess as mp
 import pyarrow as pa
 import pyarrow.feather as feather
 import io
+import binascii # Added for hex encoding/decoding
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 
@@ -129,12 +130,12 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
-    def __init__(self, metadata_dataset, directory_config, size_bucket, model_name):
+    def __init__(self, metadata_dataset, directory_config, size_bucket, model_name, base_path):
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
         self.model_name = model_name
-        self.path = Path(self.directory_config['path'])
+        self.path = base_path # Use the resolved base_path from DirectoryDataset
         self.cache_dir = self.path / 'cache' / self.model_name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
@@ -235,14 +236,14 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, model_name):
+    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, model_name, base_path):
         self.ar_frames = ar_frames
         self.resolutions = resolutions
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.model_name = model_name
         self.size_buckets = []
-        self.path = Path(directory_config['path'])
+        self.path = base_path # Use the resolved base_path from DirectoryDataset
         self.cache_dir = self.path / 'cache' / self.model_name / f'ar_frames_{self.ar_frames[0]:.3f}_{self.ar_frames[1]}'
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -255,7 +256,7 @@ class ARBucketDataset:
             size_bucket = (w, h, self.ar_frames[1])
             metadata_with_size_bucket = self.metadata_dataset.map(lambda example: {'size_bucket': size_bucket}, keep_in_memory=True)
             self.size_buckets.append(
-                SizeBucketDataset(metadata_with_size_bucket, directory_config, size_bucket, model_name)
+                SizeBucketDataset(metadata_with_size_bucket, directory_config, size_bucket, model_name, self.path) # Pass the resolved path
             )
 
     def get_size_bucket_datasets(self):
@@ -274,7 +275,7 @@ class ARBucketDataset:
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model_name, framerate=None, skip_dataset_validation=False):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None, skip_dataset_validation=False, config_file_dir=None):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
@@ -297,7 +298,19 @@ class DirectoryDataset:
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
-        self.path = Path(self.directory_config['path'])
+        
+        if 'path' in self.directory_config:
+            original_path = Path(self.directory_config['path'])
+            if original_path.name != 'data':
+                self.path = original_path / 'data'
+            else:
+                self.path = original_path
+        else:
+            # If path is not provided, default to config_file_dir / 'data'
+            if config_file_dir is None:
+                raise ValueError("config_file_dir must be provided if 'path' is not in directory_config.")
+            self.path = Path(config_file_dir) / 'data'
+            
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
@@ -347,7 +360,8 @@ class DirectoryDataset:
                 raise RuntimeError(f"Binary metadata cache not found at {metadata_bin_path}. Cannot proceed with force_cache_only=True.")
             print(f'Loading binary metadata from cache: {metadata_bin_path}')
             with open(metadata_bin_path, 'rb') as f:
-                data_bytes = f.read()
+                hex_data_bytes = f.read()
+            data_bytes = binascii.unhexlify(hex_data_bytes) # Decode from hex
             buffer = io.BytesIO(data_bytes)
             pa_table = feather.read_table(buffer)
             metadata_dataset = datasets.Dataset(pa_table)
@@ -414,9 +428,10 @@ class DirectoryDataset:
             buffer = io.BytesIO()
             feather.write_feather(pa_table, buffer)
             data_bytes = buffer.getvalue()
+            hex_data_bytes = binascii.hexlify(data_bytes) # Encode to hex
             
             with open(metadata_bin_path, 'wb') as f:
-                f.write(data_bytes)
+                f.write(hex_data_bytes) # Write hex-encoded bytes
             print(f'Saved binary metadata to cache: {metadata_bin_path}')
 
         # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
@@ -445,6 +460,7 @@ class DirectoryDataset:
                         self.directory_config,
                         size_bucket,
                         self.model_name,
+                        self.path, # Pass the resolved path
                     )
                 )
         else:
@@ -458,6 +474,7 @@ class DirectoryDataset:
                         metadata,
                         self.directory_config,
                         self.model_name,
+                        self.path, # Pass the resolved path
                     )
                 )
 
@@ -517,6 +534,8 @@ class DirectoryDataset:
                     height, width = first_frame.shape[:2]
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
                     frames = int(self.framerate * meta['duration'])
+                    if is_main_process():
+                        print(f"DEBUG: Video {image_file} - Model Framerate: {self.framerate}, Meta Duration: {meta['duration']}, Calculated Frames: {frames}")
                 else:
                     pil_img = Image.open(image_file)
                     width, height = pil_img.size
@@ -634,7 +653,7 @@ class DirectoryDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model, skip_dataset_validation=False):
+    def __init__(self, dataset_config, model, skip_dataset_validation=False, config_file_dir=None):
         super().__init__()
         self.dataset_config = dataset_config
         self.model = model
@@ -652,6 +671,7 @@ class Dataset:
                 self.model_name,
                 framerate=model.framerate,
                 skip_dataset_validation=skip_dataset_validation,
+                config_file_dir=config_file_dir, # Pass the config file directory
             )
             self.directory_datasets.append(directory_dataset)
 

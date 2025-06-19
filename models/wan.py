@@ -378,14 +378,18 @@ class WanPipeline(BasePipeline):
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
 
+        skyreels = False # Initialize skyreels to False
+
+        # Allow framerate to be explicitly set in the model config
+        if 'framerate' in self.model_config:
+            self.framerate = self.model_config['framerate']
         # SkyReels V2 uses 24 FPS. There seems to be no better way to autodetect this.
-        if 'skyreels' in Path(ckpt_dir).name.lower():
+        elif 'skyreels' in Path(ckpt_dir).name.lower():
             skyreels = True
             self.framerate = 24
             # FPS is different so make sure to use a new cache dir
             self.name = 'skyreels_v2'
-        else:
-            skyreels = False
+        # No else needed here, skyreels remains False if neither condition is met.
 
         self.original_model_config_path = os.path.join(ckpt_dir, 'config.json')
         with open(self.original_model_config_path) as f:

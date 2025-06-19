@@ -390,33 +390,44 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    with open(config['dataset']) as f:
+    dataset_config_path = Path(config['dataset'])
+    with open(dataset_config_path) as f:
         dataset_config = toml.load(f)
     gradient_release = config['optimizer'].get('gradient_release', False)
     ds_config = {
         'train_micro_batch_size_per_gpu': config.get('micro_batch_size_per_gpu', 1),
         'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
         # Can't do gradient clipping with gradient release, since there are no grads at the end of the step anymore.
-        'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
+        'gradient_clipping': 0.0 if gradient_release else config.get('gradient_clipping', 1.0),
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
-    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+    train_data = dataset_util.Dataset(
+        dataset_config,
+        model,
+        skip_dataset_validation=args.i_know_what_i_am_doing,
+        config_file_dir=dataset_config_path.parent # Pass the directory of the dataset TOML file
+    )
     dataset_manager.register(train_data)
 
     eval_data_map = {}
     for i, eval_dataset in enumerate(config['eval_datasets']):
         if type(eval_dataset) == str:
             name = f'eval{i}'
-            config_path = eval_dataset
+            config_path = Path(eval_dataset)
         else:
             name = eval_dataset['name']
-            config_path = eval_dataset['config']
+            config_path = Path(eval_dataset['config'])
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+        eval_data_map[name] = dataset_util.Dataset(
+            eval_dataset_config,
+            model,
+            skip_dataset_validation=args.i_know_what_i_am_doing,
+            config_file_dir=config_path.parent # Pass the directory of the eval dataset TOML file
+        )
         dataset_manager.register(eval_data_map[name])
 
     # For testing
