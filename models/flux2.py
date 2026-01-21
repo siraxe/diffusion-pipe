@@ -78,8 +78,7 @@ class Flux2Pipeline(ComfyPipeline):
 
     def get_call_vae_fn(self, vae):
         """
-        Returns a function to encode images with the VAE, supporting optional control images.
-        Similar to Qwen Edit implementation for reference/edit image pairs.
+        Returns a function to encode images with the VAE, supporting multiple control images.
         """
         # Get parent class's VAE encoding function
         parent_vae_fn = super().get_call_vae_fn(vae)
@@ -88,13 +87,24 @@ class Flux2Pipeline(ComfyPipeline):
             if len(args) == 1:
                 # Standard encoding - use parent implementation
                 return parent_vae_fn(args[0])
-            elif len(args) == 2:
-                # Control image provided (for reference conditioning)
-                tensor, control_tensor = args
-                # Encode both using parent's method
+            elif len(args) >= 2:
+                # Control images provided (for reference conditioning)
+                tensor = args[0]
+                control_tensors = args[1:]
+
                 result = parent_vae_fn(tensor)
-                control_result = parent_vae_fn(control_tensor)
-                result['control_latents'] = control_result['latents']
+
+                # Process only non-None control tensors
+                control_idx = 0
+                for i, control_tensor in enumerate(control_tensors):
+                    if control_tensor is None:
+                        # Skip missing controls
+                        continue
+                    control_result = parent_vae_fn(control_tensor)
+                    key = 'control_latents' if control_idx == 0 else f'control_latents_{control_idx + 1}'
+                    result[key] = control_result['latents']
+                    control_idx += 1
+
                 return result
             else:
                 raise RuntimeError(f'Unexpected number of args: {len(args)}')
@@ -169,14 +179,24 @@ class Flux2Pipeline(ComfyPipeline):
         guidance = torch.ones((bs,), device=device, dtype=torch.float32)
 
         # Handle control latents for reference conditioning (e.g., edit mode)
-        extra_inputs = ()
-        if 'control_latents' in inputs:
-            control_latents = inputs['control_latents'].float()
-            control_latents = self.model_patcher.model.process_latent_in(control_latents)
-            assert control_latents.shape == latents.shape, (
-                f"Control latents shape {control_latents.shape} doesn't match latents shape {latents.shape}"
-            )
-            extra_inputs = (control_latents,)
+        extra_inputs = []
+        for i in range(5):
+            if i == 0:
+                key = 'control_latents'
+            else:
+                key = f'control_latents_{i + 1}'
+
+            if key in inputs:
+                control_latents = inputs[key].float()
+                control_latents = self.model_patcher.model.process_latent_in(control_latents)
+                assert control_latents.shape == latents.shape, (
+                    f"Control {i + 1} shape {control_latents.shape} != latents shape {latents.shape}"
+                )
+                extra_inputs.append(control_latents)
+            else:
+                break
+
+        extra_inputs = tuple(extra_inputs)
 
         return (noisy_latents, t, text_embeds, attention_mask, guidance) + extra_inputs, (target, mask)
 
@@ -256,22 +276,29 @@ class InitialLayer(nn.Module):
 
         # Unpack inputs, handling optional control latents
         x, timesteps, txt, txt_mask, guidance, *extra = inputs
-        has_control = len(extra) > 0
+        control_latents_list = extra
         y = None
 
         bs, c, h_orig, w_orig = x.shape
         device = x.device
 
-        img, img_ids = self.process_img(x)
+        img, img_ids = self.process_img(x, index=0)
 
-        # Process control latents if present
-        if has_control:
-            control_latents = extra[0]
-            control_img, control_img_ids = self.process_img(control_latents, index=self.params.ref_index_scale)
-            control_img_len = control_img.shape[1]
-            assert control_img_len == img.shape[1], (
-                f"Control image sequence length {control_img_len} doesn't match noisy image {img.shape[1]}"
+        # Process each control with multiplied index offset
+        control_imgs = []
+        control_img_ids_list = []
+
+        for i, control_latents in enumerate(control_latents_list):
+            control_num = i + 1
+            control_img, control_img_ids = self.process_img(
+                control_latents,
+                index=control_num * self.params.ref_index_scale
             )
+            assert control_img.shape[1] == img.shape[1], (
+                f"Control {control_num} length {control_img.shape[1]} != image length {img.shape[1]}"
+            )
+            control_imgs.append(control_img)
+            control_img_ids_list.append(control_img_ids)
 
         img_len = torch.tensor(img.shape[1], dtype=torch.int64, device=device)
 
@@ -283,13 +310,13 @@ class InitialLayer(nn.Module):
 
         img = self.img_in(img)
 
-        # Process control image with same img_in projection if present
-        if has_control:
-            control_img = self.img_in(control_img)
-            # Concatenate noisy image and control image along sequence dimension
-            img = torch.cat([img, control_img], dim=1)
-            # Update img_ids to include control image positions
-            img_ids = torch.cat([img_ids, control_img_ids], dim=1)
+        if len(control_imgs) > 0:
+            for i in range(len(control_imgs)):
+                control_imgs[i] = self.img_in(control_imgs[i])
+
+            # Concatenate: [noisy_img, control1, control2, ...]
+            img = torch.cat([img] + control_imgs, dim=1)
+            img_ids = torch.cat([img_ids] + control_img_ids_list, dim=1)
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.params.guidance_embed:
             if guidance is not None:
