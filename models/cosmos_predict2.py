@@ -11,6 +11,7 @@
 # limitations under the License.
 
 import math
+import os
 import os.path
 
 import torch
@@ -43,6 +44,20 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
     m = (y2 - y1) / (x2 - x1)
     b = y1 - m * x1
     return lambda x: m * x + b
+
+
+def _get_config_path(relative_path: str) -> str:
+    """Get config path with fallback to script-relative path."""
+    # First try the relative path (for when running from diffusion-pipe directory)
+    if os.path.exists(relative_path):
+        return relative_path
+    # Fallback to path relative to this script's directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fallback_path = os.path.join(script_dir, '..', relative_path)
+    if os.path.exists(fallback_path):
+        return fallback_path
+    # Return the fallback path even if it doesn't exist (let the error propagate)
+    return fallback_path
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
@@ -203,8 +218,8 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         self.is_generic_llm = False
         self.t5_tokenizer = T5TokenizerFast(
-            vocab_file='configs/t5_old/spiece.model',
-            tokenizer_file='configs/t5_old/tokenizer.json',
+            vocab_file=_get_config_path('configs/t5_old/spiece.model'),
+            tokenizer_file=_get_config_path('configs/t5_old/tokenizer.json'),
         )
 
         if 't5_path' in self.model_config:
@@ -220,7 +235,7 @@ class CosmosPredict2Pipeline(BasePipeline):
                 quantization_config = None
             self.text_encoder = T5EncoderModel.from_pretrained(
                 None,
-                config='configs/t5_old/config.json',
+                config=_get_config_path('configs/t5_old/config.json'),
                 state_dict=t5_state_dict,
                 torch_dtype='auto',
                 local_files_only=True,
@@ -238,8 +253,9 @@ class CosmosPredict2Pipeline(BasePipeline):
                 text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
             else:
                 # assume Qwen3-0.6b (Anima)
-                self.tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
-                llm_config = transformers.Qwen3Config.from_pretrained('configs/qwen3_06b', local_files_only=True)
+                qwen_config_path = _get_config_path('configs/qwen3_06b')
+                self.tokenizer = AutoTokenizer.from_pretrained(qwen_config_path, local_files_only=True)
+                llm_config = transformers.Qwen3Config.from_pretrained(qwen_config_path, local_files_only=True)
                 with init_empty_weights():
                     text_encoder = transformers.Qwen3ForCausalLM(llm_config)
                 for key, tensor in iterate_safetensors(llm_path):
