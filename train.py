@@ -336,7 +336,7 @@ if __name__ == '__main__':
     elif model_type == 'sd3':
         from models import sd3
         model = sd3.SD3Pipeline(config)
-    elif model_type == 'cosmos_predict2':
+    elif model_type == 'cosmos_predict2' or model_type == 'anima':
         from models import cosmos_predict2
         model = cosmos_predict2.CosmosPredict2Pipeline(config)
     elif model_type == 'omnigen2':

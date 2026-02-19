@@ -24,6 +24,8 @@ from torch import nn
 from torch.distributed import get_process_group_ranks
 from torchvision import transforms
 
+from .llm_adapter import LLMAdapter
+
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
     """Change sign so the last dimension becomes [-odd, +even]
@@ -1208,6 +1210,7 @@ class MiniTrainDIT(nn.Module):
         extra_w_extrapolation_ratio: float = 1.0,
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
+        use_llm_adapter=False,
     ) -> None:
         atten_backend = 'torch'
 
@@ -1238,6 +1241,7 @@ class MiniTrainDIT(nn.Module):
         self.extra_w_extrapolation_ratio = extra_w_extrapolation_ratio
         self.extra_t_extrapolation_ratio = extra_t_extrapolation_ratio
         self.rope_enable_fps_modulation = rope_enable_fps_modulation
+        self.use_llm_adapter = use_llm_adapter
         self.cuda_graphs = {}
 
         self.build_patch_embed()
@@ -1248,6 +1252,15 @@ class MiniTrainDIT(nn.Module):
             Timesteps(model_channels),
             TimestepEmbedding(model_channels, model_channels, use_adaln_lora=use_adaln_lora),
         )
+
+        if self.use_llm_adapter:
+            self.llm_adapter = LLMAdapter(
+                source_dim=1024,
+                target_dim=1024,
+                model_dim=1024,
+                num_layers=6,
+                self_attn=True,
+            )
 
         self.blocks = nn.ModuleList(
             [
