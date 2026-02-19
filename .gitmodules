@@ -1,27 +1,36 @@
 [submodule "submodules/HunyuanVideo"]
 	path = submodules/HunyuanVideo
+	ignore = dirty
 	url = https://github.com/Tencent/HunyuanVideo
 [submodule "submodules/Cosmos"]
 	path = submodules/Cosmos
+	ignore = dirty
 	url = https://github.com/NVIDIA/Cosmos
 [submodule "submodules/Lumina_2"]
 	path = submodules/Lumina_2
+	ignore = dirty
 	url = https://github.com/Alpha-VLLM/Lumina-Image-2.0
 [submodule "submodules/flow"]
 	path = submodules/flow
+	ignore = dirty
 	url = https://github.com/lodestone-rock/flow
 [submodule "submodules/HiDream"]
 	path = submodules/HiDream
+	ignore = dirty
 	url = https://github.com/HiDream-ai/HiDream-I1
 [submodule "submodules/LTX_Video"]
 	path = submodules/LTX_Video
+	ignore = dirty
 	url = https://github.com/Lightricks/LTX-Video
 [submodule "submodules/OmniGen2"]
 	path = submodules/OmniGen2
+	ignore = dirty
 	url = https://github.com/VectorSpaceLab/OmniGen2
 [submodule "submodules/HunyuanImage-2.1"]
 	path = submodules/HunyuanImage-2.1
+	ignore = dirty
 	url = https://github.com/Tencent-Hunyuan/HunyuanImage-2.1
 [submodule "submodules/ComfyUI"]
 	path = submodules/ComfyUI
+	ignore = dirty
 	url = https://github.com/comfyanonymous/ComfyUI
