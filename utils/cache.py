@@ -26,7 +26,9 @@ class Cache:
         assert isinstance(idx, int)
         shard_id, shard_index = self.items[idx]
         offset, size = self.shard_metadata[shard_id][shard_index]
-        f = self.open_files.setdefault(shard_id, open(self.path / f'shard_{shard_id}.bin', 'rb'))
+        if shard_id not in self.open_files:
+            self.open_files[shard_id] = open(self.path / f'shard_{shard_id}.bin', 'rb')
+        f = self.open_files[shard_id]
         f.seek(offset)
         byte_string = f.read(size)
         buffer = io.BytesIO(byte_string)

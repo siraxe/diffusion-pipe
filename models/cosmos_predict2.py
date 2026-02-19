@@ -1,22 +1,38 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
+import os.path
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 import safetensors
 import transformers
-from transformers import T5TokenizerFast, T5EncoderModel
+from transformers import T5TokenizerFast, T5EncoderModel, AutoTokenizer, AutoModelForCausalLM
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
-from utils.common import load_state_dict, AUTOCAST_DTYPE
+from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
 
 
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
+
+MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
+MULTISCALE_LOSS_THRESHOLDS.sort()
 
 
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -89,8 +105,8 @@ def vae_encode(tensor, vae):
 
 def get_dit_config(state_dict, key_prefix=''):
     dit_config = {}
-    dit_config["max_img_h"] = 240
-    dit_config["max_img_w"] = 240
+    dit_config["max_img_h"] = 512
+    dit_config["max_img_w"] = 512
     dit_config["max_frames"] = 128
     concat_padding_mask = True
     dit_config["in_channels"] = (state_dict['{}x_embedder.proj.1.weight'.format(key_prefix)].shape[1] // 4) - int(concat_padding_mask)
@@ -114,6 +130,9 @@ def get_dit_config(state_dict, key_prefix=''):
     elif dit_config["model_channels"] == 5120:
         dit_config["num_blocks"] = 36
         dit_config["num_heads"] = 40
+    elif dit_config["model_channels"] == 1280:
+        dit_config["num_blocks"] = 20
+        dit_config["num_heads"] = 20
 
     if dit_config["in_channels"] == 16:
         dit_config["extra_per_block_abs_pos_emb"] = False
@@ -141,28 +160,15 @@ def _tokenize(tokenizer, prompts):
         truncation=True,
         padding="max_length",
         max_length=512,
-        return_length=True,
-        return_offsets_mapping=False,
     )
 
-def _compute_text_embeddings(text_encoder, input_ids, attn_mask):
+def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False):
     input_ids = input_ids.to(text_encoder.device)
     attn_mask = attn_mask.to(text_encoder.device)
 
     outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask)
-
     encoded_text = outputs.last_hidden_state
-    lengths = attn_mask.sum(dim=1).cpu()
-
-    for batch_id in range(encoded_text.shape[0]):
-        length = lengths[batch_id]
-        # This is tricky. Based on Nvidia's official code, when the prompt is '' or when dropping out text embeddings,
-        # the embeddings are zeroed out completely. But the attention mask for an empty string looks like
-        # [1, 0, 0, ...] because of the BOS token. So it's not zeroed out unless we explicitly set length to 0 here.
-        # If you don't do this, training on unconditional text embeddings will NaN the loss pretty quickly.
-        if length == 1:
-            length = 0
-        encoded_text[batch_id][length:] = 0
+    encoded_text[~attn_mask.bool()] = 0
 
     return encoded_text
 
@@ -171,7 +177,10 @@ class CosmosPredict2Pipeline(BasePipeline):
     name = 'cosmos_predict2'
     framerate = 16
     checkpointable_layers = ['TransformerLayer']
-    adapter_target_modules = ['Block']
+    adapter_target_modules = [
+        'Block',
+        'TransformerBlock',  # LLM adapter
+    ]
 
     def __init__(self, config):
         self.config = config
@@ -179,6 +188,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         dtype = self.model_config['dtype']
         self.cache_text_embeddings = self.model_config.get('cache_text_embeddings', True)
+        self.multiscale_loss_weight = self.model_config.get('multiscale_loss_weight', None)
 
         # This isn't a nn.Module.
         self.vae = WanVAE(
@@ -191,31 +201,59 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.vae.std = self.vae.std.to('cuda')
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
 
-        self.tokenizer = T5TokenizerFast(
+        self.is_generic_llm = False
+        self.t5_tokenizer = T5TokenizerFast(
             vocab_file='configs/t5_old/spiece.model',
             tokenizer_file='configs/t5_old/tokenizer.json',
         )
-        t5_state_dict = load_state_dict(self.model_config['t5_path'])
-        if self.model_config.get('text_encoder_nf4', False):
-            quantization_config = transformers.BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type='nf4',
-                bnb_4bit_compute_dtype=dtype,
+
+        if 't5_path' in self.model_config:
+            self.tokenizer = self.t5_tokenizer
+            t5_state_dict = load_state_dict(self.model_config['t5_path'])
+            if self.model_config.get('text_encoder_nf4', False):
+                quantization_config = transformers.BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type='nf4',
+                    bnb_4bit_compute_dtype=dtype,
+                )
+            else:
+                quantization_config = None
+            self.text_encoder = T5EncoderModel.from_pretrained(
+                None,
+                config='configs/t5_old/config.json',
+                state_dict=t5_state_dict,
+                torch_dtype='auto',
+                local_files_only=True,
+                quantization_config=quantization_config,
             )
+            if quantization_config is None and self.model_config.get('text_encoder_fp8', False):
+                for name, p in self.text_encoder.named_parameters():
+                    if p.ndim == 2 and not ('shared' in name or 'relative_attention_bias' in name):
+                        p.data = p.data.to(torch.float8_e4m3fn)
+        elif 'llm_path' in self.model_config:
+            llm_path = self.model_config['llm_path']
+            if os.path.isdir(llm_path):
+                # generic Transformers LLM
+                self.tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
+                text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
+            else:
+                # assume Qwen3-0.6b (Anima)
+                self.tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
+                llm_config = transformers.Qwen3Config.from_pretrained('configs/qwen3_06b', local_files_only=True)
+                with init_empty_weights():
+                    text_encoder = transformers.Qwen3ForCausalLM(llm_config)
+                for key, tensor in iterate_safetensors(llm_path):
+                    set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
+            self.text_encoder = text_encoder.model
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.text_encoder.config.use_cache = False
+            self.is_generic_llm = True
+            # text encoder is different from Cosmos, use a different cache dir
+            self.name = 'anima'
         else:
-            quantization_config = None
-        self.text_encoder = T5EncoderModel.from_pretrained(
-            None,
-            config='configs/t5_old/config.json',
-            state_dict=t5_state_dict,
-            torch_dtype='auto',
-            local_files_only=True,
-            quantization_config=quantization_config,
-        )
-        if quantization_config is None and self.model_config.get('text_encoder_fp8', False):
-            for name, p in self.text_encoder.named_parameters():
-                if p.ndim == 2 and not ('shared' in name or 'relative_attention_bias' in name):
-                    p.data = p.data.to(torch.float8_e4m3fn)
+            raise RuntimeError('Missing text encoder path')
+
         self.text_encoder.requires_grad_(False)
 
     def load_diffusion_model(self):
@@ -232,11 +270,35 @@ class CosmosPredict2Pipeline(BasePipeline):
         state_dict = new_state_dict
 
         dit_config = get_dit_config(state_dict)
+
+        if 'llm_adapter_path' in self.model_config:
+            self.use_llm_adapter = True
+            dit_config['use_llm_adapter'] = True
+            llm_adapter_state_dict = {
+                k: v.to(dtype)
+                for k, v in load_state_dict(self.model_config['llm_adapter_path']).items()
+            }
+        elif 'llm_adapter.out_proj.weight' in state_dict:
+            self.use_llm_adapter = True
+            dit_config['use_llm_adapter'] = True
+            llm_adapter_state_dict = None  # llm_adapter gets loaded as part of the DiT
+        else:
+            self.use_llm_adapter = False
+
         with init_empty_weights():
             transformer = MiniTrainDIT(**dit_config)
-        for name, p in transformer.named_parameters():
-            dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
-            set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+            for name, p in transformer.named_parameters():
+                if name not in state_dict:
+                    continue
+                dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
+                set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+
+        if self.use_llm_adapter and llm_adapter_state_dict is not None:
+            llm_adapter = transformer.llm_adapter
+            for name, p in llm_adapter.named_parameters():
+                dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
+                set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
+
         self.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
@@ -280,8 +342,9 @@ class CosmosPredict2Pipeline(BasePipeline):
         def fn(captions, is_video):
             # args are lists
             batch_encoding = _tokenize(self.tokenizer, captions)
+            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
             encoded_text = _compute_text_embeddings(self.text_encoder, batch_encoding.input_ids, batch_encoding.attention_mask)
-            return {'prompt_embeds': encoded_text}
+            return {'prompt_embeds': encoded_text, 'attn_mask': batch_encoding.attention_mask, 't5_input_ids': t5_batch_encoding.input_ids, 't5_attn_mask': t5_batch_encoding.attention_mask}
         return fn
 
     # Note to myself / future readers:
@@ -296,10 +359,12 @@ class CosmosPredict2Pipeline(BasePipeline):
         mask = inputs['mask']
 
         if self.cache_text_embeddings:
-            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'],)
+            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'], inputs['t5_input_ids'], inputs['t5_attn_mask'])
         else:
-            batch_encoding = _tokenize(self.tokenizer, inputs['caption'])
-            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask)
+            captions = inputs['caption']
+            batch_encoding = _tokenize(self.tokenizer, captions)
+            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
+            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask, t5_batch_encoding.input_ids, t5_batch_encoding.attention_mask)
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -337,13 +402,17 @@ class CosmosPredict2Pipeline(BasePipeline):
         t_expanded = t.view(-1, 1, 1, 1, 1)
         noisy_latents = (1 - t_expanded)*latents + t_expanded*noise
         target = noise - latents
+        t = t.view(-1, 1)
 
-        return (noisy_latents, t.view(-1, 1), *prompt_embeds_or_batch_encoding), (target, mask)
+        return (noisy_latents, t, *prompt_embeds_or_batch_encoding), (target, mask)
 
     def to_layers(self):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
-        layers = [InitialLayer(transformer, text_encoder)]
+        layers = [
+            InitialLayer(transformer, text_encoder, self.is_generic_llm),
+            LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None),
+        ]
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(transformer))
@@ -376,9 +445,91 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def get_param_groups(self, parameters):
+        base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
+        for p in parameters:
+            name = p.original_name
+            if 'llm_adapter' in name:
+                llm_adapter_params.append(p)
+            elif '.self_attn' in name:
+                self_attn_params.append(p)
+            elif '.cross_attn' in name:
+                cross_attn_params.append(p)
+            elif '.mlp' in name:
+                mlp_params.append(p)
+            elif '.adaln_modulation' in name:
+                mod_params.append(p)
+            else:
+                base_params.append(p)
+
+        base_lr = self.config['optimizer'].get('lr', None)
+        self_attn_lr = self.model_config.get('self_attn_lr', base_lr)
+        cross_attn_lr = self.model_config.get('cross_attn_lr', base_lr)
+        mlp_lr = self.model_config.get('mlp_lr', base_lr)
+        mod_lr = self.model_config.get('mod_lr', base_lr)
+        llm_adapter_lr = self.model_config.get('llm_adapter_lr', base_lr)
+
+        if is_main_process():
+            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}')
+            print(f'Num base params: {len(base_params)}')
+            print(f'Num self_attn params: {len(self_attn_params)}')
+            print(f'Num cross_attn params: {len(cross_attn_params)}')
+            print(f'Num mlp params: {len(mlp_params)}')
+            print(f'Num mod params: {len(mod_params)}')
+            print(f'Num llm_adapter params: {len(llm_adapter_params)}')
+
+        param_groups = []
+        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params)]:
+            if lr == 0:
+                for p in params:
+                    p.requires_grad_(False)
+            elif len(params) > 0:
+                param_groups.append({'params': params, 'lr': lr})
+
+        return param_groups
+
+    def get_loss_fn(self):
+        def loss_fn(output, label):
+            target, mask = label
+            with torch.autocast('cuda', enabled=False):
+                output = output.to(torch.float32)
+                target = target.to(output.device, torch.float32)
+                if 'pseudo_huber_c' in self.config:
+                    c = self.config['pseudo_huber_c']
+                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                else:
+                    loss = F.mse_loss(output, target, reduction='none')
+                # empty tensor means no masking
+                if mask.numel() > 0:
+                    mask = mask.to(output.device, torch.float32)
+                    loss *= mask
+                loss = loss.mean()
+
+                if weight := self.multiscale_loss_weight:
+                    assert output.ndim == 5 and target.ndim == 5
+                    output = output.squeeze(2)
+                    target = target.squeeze(2)
+                    terms = [loss]
+                    total_weight = 1.0
+                    h, w = target.shape[-2:]
+                    side_length = math.sqrt(h*w) * 8
+                    for thresh in MULTISCALE_LOSS_THRESHOLDS:
+                        if side_length >= thresh:
+                            output = F.avg_pool2d(output, 2)
+                            target = F.avg_pool2d(target, 2)
+                            additional_loss = F.mse_loss(output, target) * weight
+                            terms.append(additional_loss)
+                            total_weight += weight
+                        else:
+                            break
+                    loss = sum(terms) / total_weight
+
+            return loss
+        return loss_fn
+
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder):
+    def __init__(self, model, text_encoder, is_generic_llm):
         super().__init__()
         self.x_embedder = model.x_embedder
         self.pos_embedder = model.pos_embedder
@@ -388,16 +539,18 @@ class InitialLayer(nn.Module):
         self.t_embedding_norm = model.t_embedding_norm
         self.text_encoder = text_encoder
         self.model = [model]
+        self.is_generic_llm = is_generic_llm
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x_B_C_T_H_W, timesteps_B_T, *prompt_embeds_or_batch_encoding = inputs
 
-        if len(prompt_embeds_or_batch_encoding) == 1:
-            crossattn_emb = prompt_embeds_or_batch_encoding[0]
+        if torch.is_floating_point(prompt_embeds_or_batch_encoding[0]):
+            crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
         else:
             with torch.no_grad():
-                crossattn_emb = _compute_text_embeddings(self.text_encoder, *prompt_embeds_or_batch_encoding)
+                input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
+                crossattn_emb = _compute_text_embeddings(self.text_encoder[0], input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
 
         padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(
@@ -413,10 +566,32 @@ class InitialLayer(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
-        for item in outputs:
-            item.requires_grad_(True)
+        outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        for tensor in outputs:
+            if torch.is_floating_point(tensor):
+                tensor.requires_grad_(True)
         return outputs
+
+
+class LLMAdapterLayer(nn.Module):
+    def __init__(self, llm_adapter):
+        super().__init__()
+        self.llm_adapter = llm_adapter
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
+
+        if self.llm_adapter is not None:
+            crossattn_emb = self.llm_adapter(
+                source_hidden_states=crossattn_emb,
+                target_input_ids=t5_input_ids,
+                target_attention_mask=t5_attn_mask,
+                source_attention_mask=attn_mask,
+            )
+            crossattn_emb[~t5_attn_mask.bool()] = 0
+
+        return make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
 
 
 class TransformerLayer(nn.Module):
@@ -445,9 +620,6 @@ class FinalLayer(nn.Module):
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
-
-    def get_per_sigma_loss_weights(self, sigma: torch.Tensor) -> torch.Tensor:
-        return (sigma**2 + self.pipe.sigma_data**2) / (sigma * self.pipe.sigma_data) ** 2
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):

@@ -84,7 +84,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=1)
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
 
     if map_fn is None:
         # loading directly from cache without mapping
