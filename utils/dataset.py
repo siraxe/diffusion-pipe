@@ -1369,6 +1369,10 @@ class PipelineDataLoader:
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        # Handle epoch boundary: if we've pulled all batches in the epoch, move to next epoch
+        if self.num_batches_pulled >= len(self.dataset):
+            self.num_batches_pulled = 0
+            self.epoch += 1
         self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
         self.data = self._pull_batches_from_dataloader()
         # Recreate the dataloader after the first pass so that it won't skip

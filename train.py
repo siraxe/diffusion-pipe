@@ -11,6 +11,7 @@ import time
 import random
 import json
 import inspect
+import math
 from pathlib import Path
 from collections import defaultdict
 
@@ -124,6 +125,7 @@ def set_config_defaults(config):
                 )
             adapter_config['alpha'] = adapter_config['rank']
             adapter_config.setdefault('dropout', 0.0)
+            adapter_config.setdefault('dropout_before_resume', 0.0)
             adapter_config.setdefault('dtype', model_dtype_str)
             adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
         else:
@@ -259,6 +261,22 @@ def get_prodigy_d(optimizer):
     return d / len(optimizer.param_groups)
 
 
+def get_prodigyplus_schedulefree_lr(optimizer):
+    """Get the effective learning rate from ProdigyPlusScheduleFree optimizer."""
+    if not hasattr(optimizer, 'param_groups') or not optimizer.param_groups:
+        return 0.0
+
+    # Get the effective_lr from the first param_group
+    # This includes d * lr * schedulefree_adjustment
+    group = optimizer.param_groups[0]
+    effective_lr = group.get('effective_lr', group.get('lr', 0.0))
+
+    # Also get the d value for logging
+    d = group.get('d', 0.0)
+
+    return effective_lr, d
+
+
 def _get_automagic_lrs(optimizer):
     lrs = []
     for group in optimizer.param_groups:
@@ -268,6 +286,243 @@ def _get_automagic_lrs(optimizer):
             lrs.append(lr)
     lrs = torch.stack(lrs)
     return lrs, lrs.mean()
+
+
+def reset_lora_weights_percentage(model, dropout_percentage):
+    """
+    Reset a percentage of LoRA weights to help prevent overfitting when resuming training.
+    This randomly reinitializes lora_a and lora_b weights in the specified percentage of layers.
+
+    Args:
+        model: The model containing LoRA adapters
+        dropout_percentage: Percentage of LoRA weights to reset (0.0-1.0)
+    """
+    if dropout_percentage <= 0.0:
+        return
+
+    if is_main_process():
+        print(f'\nResetting {dropout_percentage*100:.1f}% of LoRA weights to combat overfitting...')
+
+    reset_count = 0
+    total_count = 0
+
+    # Iterate through all modules in the model
+    for name, module in model.named_modules():
+        if hasattr(module, 'lora_a') and hasattr(module, 'lora_b'):
+            # Check if this module has LoRA weights
+            if isinstance(module.lora_a, dict) and 'default' in module.lora_a:
+                total_count += 1
+                if random.random() < dropout_percentage:
+                    # Reset lora_a and lora_b weights
+                    torch.nn.init.kaiming_uniform_(module.lora_a['default'].weight, a=math.sqrt(5))
+                    torch.nn.init.zeros_(module.lora_b['default'].weight)
+                    reset_count += 1
+
+    if is_main_process():
+        print(f'Reset {reset_count}/{total_count} LoRA layers\n')
+
+
+def resize_lora_checkpoint_for_rank_mismatch(checkpoint_dir, current_lora_rank):
+    """
+    Resize LoRA checkpoint weights to match current model's LoRA rank.
+    This handles rank mismatches when resuming from a checkpoint with a different rank.
+
+    When increasing rank: old weights are preserved, new dimensions are zero-initialized.
+    When decreasing rank: weights are truncated to fit the new rank.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory (can be run_dir or specific checkpoint subdir)
+        current_lora_rank: Current model's LoRA rank from config
+
+    Returns:
+        True if weights were resized, False otherwise
+    """
+    import glob
+    import re
+
+    if is_main_process():
+        print(f'[DEBUG] resize_lora_checkpoint_for_rank_mismatch called with: checkpoint_dir={checkpoint_dir}, current_lora_rank={current_lora_rank}')
+
+    checkpoint_dir = Path(checkpoint_dir)
+
+    # First, check if layer files exist directly in checkpoint_dir
+    layer_files = sorted(glob.glob(str(checkpoint_dir / "layer_*-model_states.pt")))
+    if is_main_process():
+        print(f'[DEBUG] Direct layer_files found: {len(layer_files)}')
+
+    # If no layer files found, look for checkpoint subdirectories (global_stepXXX, epochXX)
+    if not layer_files:
+        # Check for 'latest' file to determine which checkpoint subdir to use
+        latest_file = checkpoint_dir / "latest"
+        if is_main_process():
+            print(f'[DEBUG] latest_file exists: {latest_file.exists()}')
+        if latest_file.exists():
+            with open(latest_file, 'r') as f:
+                checkpoint_tag = f.read().strip()
+            if is_main_process():
+                print(f'[DEBUG] checkpoint_tag: {checkpoint_tag}')
+            checkpoint_subdir = checkpoint_dir / checkpoint_tag
+            layer_files = sorted(glob.glob(str(checkpoint_subdir / "layer_*-model_states.pt")))
+            if is_main_process():
+                print(f'[DEBUG] layer_files from latest: {len(layer_files)}')
+            if layer_files:
+                checkpoint_dir = checkpoint_subdir  # Update checkpoint_dir to the actual subdir
+
+        # Fallback: try to find the most recent checkpoint subdirectory
+        if not layer_files:
+            checkpoint_subdirs = sorted(
+                [d for d in checkpoint_dir.iterdir() if d.is_dir() and (d.name.startswith('global_step') or d.name.startswith('epoch'))],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+            if is_main_process():
+                print(f'[DEBUG] checkpoint_subdirs found: {len(checkpoint_subdirs)}')
+            if checkpoint_subdirs:
+                checkpoint_subdir = checkpoint_subdirs[0]
+                layer_files = sorted(glob.glob(str(checkpoint_subdir / "layer_*-model_states.pt")))
+                if is_main_process():
+                    print(f'[DEBUG] layer_files from fallback: {len(layer_files)}')
+                if layer_files:
+                    checkpoint_dir = checkpoint_subdir
+
+    if not layer_files:
+        if is_main_process():
+            print('[DEBUG] No layer files found, returning False')
+        return False
+
+    if is_main_process():
+        print(f'[DEBUG] Found {len(layer_files)} layer files, using checkpoint_dir: {checkpoint_dir}')
+
+    # Get the first layer checkpoint that contains LoRA weights to inspect rank
+    # (layer_00 might not have LoRA weights, so we need to find one that does)
+    first_checkpoint = None
+    first_checkpoint_path = None
+
+    for layer_file in layer_files:
+        ckpt = torch.load(layer_file, map_location='cpu')
+        # Check if this file has LoRA weights
+        has_lora = any('lora_A.default.weight' in k or 'lora_A.weight' in k or
+                       'lora_B.default.weight' in k or 'lora_B.weight' in k
+                       for k in ckpt.keys())
+        if has_lora:
+            first_checkpoint = ckpt
+            first_checkpoint_path = layer_file
+            break
+
+    if first_checkpoint is None:
+        if is_main_process():
+            print('[DEBUG] No layer files contain LoRA weights, returning False')
+        return False
+
+    # Detect checkpoint rank from first LoRA weight found
+    checkpoint_rank = None
+    sample_key = None
+
+    for key, tensor in first_checkpoint.items():
+        if 'lora_A.default.weight' in key or 'lora_A.weight' in key:
+            # lora_A has shape [rank, hidden_dim]
+            checkpoint_rank = tensor.shape[0]
+            sample_key = key
+            break
+        elif 'lora_B.default.weight' in key or 'lora_B.weight' in key:
+            # lora_B has shape [hidden_dim, rank]
+            checkpoint_rank = tensor.shape[1]
+            sample_key = key
+            break
+
+    if is_main_process():
+        print(f'[DEBUG] checkpoint_rank: {checkpoint_rank}, sample_key: {sample_key}')
+
+    if checkpoint_rank is None:
+        if is_main_process():
+            print('[DEBUG] No LoRA weights found in checkpoint, returning False')
+        return False  # No LoRA weights found
+
+    if checkpoint_rank == current_lora_rank:
+        if is_main_process():
+            print('[DEBUG] No rank mismatch, returning False')
+        return False  # No mismatch
+
+    # Rank mismatch detected - resize all checkpoint files
+    if is_main_process():
+        print(f'\n🔄 LoRA rank mismatch detected:')
+        print(f'   Checkpoint rank: {checkpoint_rank}')
+        print(f'   Config rank: {current_lora_rank}')
+
+    # Backup originals by copying to temp files
+    temp_files = {}
+    for layer_file in layer_files:
+        temp_path = layer_file + '.tmp_resize'
+        shutil.copy(layer_file, temp_path)
+        temp_files[layer_file] = temp_path
+
+    try:
+        # Process each layer checkpoint
+        rank_mismatch_count = 0
+        for layer_file in layer_files:
+            state_dict = torch.load(temp_files[layer_file], map_location='cpu')
+            modified = False
+
+            for key, weight in list(state_dict.items()):
+                # Handle lora_A weights (rank is first dimension)
+                if 'lora_A.default.weight' in key or 'lora_A.weight' in key:
+                    old_rank = weight.shape[0]
+                    new_rank = current_lora_rank
+
+                    if old_rank != new_rank:
+                        modified = True
+                        if new_rank > old_rank:
+                            # Expand: pad with zeros
+                            new_weight = torch.zeros(new_rank, weight.shape[1], dtype=weight.dtype)
+                            new_weight[:old_rank, :] = weight
+                            state_dict[key] = new_weight
+                        else:
+                            # Shrink: truncate
+                            state_dict[key] = weight[:new_rank, :]
+                        rank_mismatch_count += 1
+
+                # Handle lora_B weights (rank is last dimension)
+                elif 'lora_B.default.weight' in key or 'lora_B.weight' in key:
+                    old_rank = weight.shape[1]
+                    new_rank = current_lora_rank
+
+                    if old_rank != new_rank:
+                        modified = True
+                        if new_rank > old_rank:
+                            # Expand: pad with zeros
+                            new_weight = torch.zeros(weight.shape[0], new_rank, dtype=weight.dtype)
+                            new_weight[:, :old_rank] = weight
+                            state_dict[key] = new_weight
+                        else:
+                            # Shrink: truncate
+                            state_dict[key] = weight[:, :new_rank]
+                        rank_mismatch_count += 1
+
+            # Save the modified checkpoint
+            if modified:
+                torch.save(state_dict, layer_file)
+
+        if is_main_process():
+            if checkpoint_rank < current_lora_rank:
+                print(f'   Action: Expanding rank ({checkpoint_rank} → {current_lora_rank}), new dims zero-initialized')
+            else:
+                print(f'   Action: Truncating rank ({checkpoint_rank} → {current_lora_rank})')
+            print(f'   Resized {rank_mismatch_count} LoRA weights across {len(layer_files)} layer files\n')
+
+        return True
+
+    except Exception as e:
+        # Restore original files on error
+        if is_main_process():
+            print(f'Error during LoRA resize, restoring originals: {e}')
+        for layer_file, temp_path in temp_files.items():
+            shutil.copy(temp_path, layer_file)
+        raise
+    finally:
+        # Clean up temp files
+        for temp_path in temp_files.values():
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 if __name__ == '__main__':
@@ -360,6 +615,12 @@ if __name__ == '__main__':
     elif model_type == 'flux2':
         from models import flux2
         model = flux2.Flux2Pipeline(config)
+    elif model_type == 'qwen_image_plus':
+        from models import qwen_image_plus
+        model = qwen_image_plus.QwenImagePlusPipeline(config)
+    elif model_type == 'longcat':
+        from models import longcat_video
+        model = longcat_video.LongcatVideoPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -626,6 +887,22 @@ if __name__ == '__main__':
         args = []
         kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
 
+        # Special handling for automagic: convert betas to beta2
+        if optim_type_lower == 'automagic' and 'betas' in kwargs:
+            betas = kwargs.pop('betas')
+            if isinstance(betas, (list, tuple)) and len(betas) >= 2:
+                kwargs['beta2'] = betas[1]  # Use beta2 from betas tuple
+            elif isinstance(betas, str):
+                # Parse string like "[0.9, 0.99]" or "(0.9, 0.99)"
+                import re
+                match = re.match(r'[\[\(]\s*([0-9.]+)\s*,\s*([0-9.]+)\s*[\]\)]', betas)
+                if match:
+                    kwargs['beta2'] = float(match.group(2))
+                else:
+                    kwargs['beta2'] = 0.999  # Default fallback
+            else:
+                kwargs['beta2'] = 0.999  # Default fallback
+
         if optim_type_lower == 'adamw':
             # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
             # when Deepspeed tries to build the fused Adam extension.
@@ -656,6 +933,9 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             from optimizers import generic_optim
             klass = generic_optim.GenericOptim
+        elif optim_type_lower == 'prodigyplusschedulefree':
+            from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            klass = ProdigyPlusScheduleFree
         else:
             import pytorch_optimizer
             klass = getattr(pytorch_optimizer, optim_type)
@@ -801,11 +1081,47 @@ if __name__ == '__main__':
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
         param_groups = optimizer.param_groups.copy()
+
+        # Check if optimizer type has changed since checkpoint
+        checkpoint_config_path = os.path.join(run_dir, 'last_config.toml')
+        load_optimizer_states = not args.reset_optimizer
+        optimizer_changed = False
+
+        if os.path.exists(checkpoint_config_path) and load_optimizer_states:
+            try:
+                import toml
+                with open(checkpoint_config_path, 'r') as f:
+                    checkpoint_config = toml.load(f)
+                checkpoint_optimizer_type = checkpoint_config.get('optimizer', {}).get('type', '')
+                current_optimizer_type = config.get('optimizer', {}).get('type', '')
+                if checkpoint_optimizer_type and current_optimizer_type:
+                    checkpoint_opt_lower = checkpoint_optimizer_type.lower().replace('-', '_').replace('8bit', '8_bit')
+                    current_opt_lower = current_optimizer_type.lower().replace('-', '_').replace('8bit', '8_bit')
+                    if checkpoint_opt_lower != current_opt_lower:
+                        optimizer_changed = True
+                        load_optimizer_states = False
+                        if is_main_process():
+                            print(f'Optimizer type changed from checkpoint ({checkpoint_optimizer_type}) to config ({current_optimizer_type})')
+                            print('Skipping optimizer state loading. Starting with fresh optimizer state.')
+            except Exception:
+                pass  # If we can't read the config, proceed with loading
+
+        # Handle LoRA rank mismatch - resize checkpoint weights if needed
+        if adapter_config := config.get('adapter', None):
+            current_lora_rank = adapter_config.get('rank', None)
+            if is_main_process():
+                print(f'[DEBUG] adapter_config: {adapter_config}')
+                print(f'[DEBUG] current_lora_rank: {current_lora_rank}')
+                print(f'[DEBUG] run_dir: {run_dir}')
+            if current_lora_rank is not None:
+                resize_lora_checkpoint_for_rank_mismatch(run_dir, current_lora_rank)
+                dist.barrier()  # Ensure all ranks wait for rank 0 to finish resizing
+
         load_path, client_state = model_engine.load_checkpoint(
             run_dir,
             load_module_strict=False,
             load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
-            load_optimizer_states=not args.reset_optimizer,
+            load_optimizer_states=load_optimizer_states,
         )
         if args.reset_optimizer_params:
             optimizer.param_groups = param_groups
@@ -824,6 +1140,21 @@ if __name__ == '__main__':
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
 
+        # Reset LoRA weights if dropout_before_resume is configured
+        if adapter_config := config.get('adapter', None):
+            dropout_before_resume = adapter_config.get('dropout_before_resume', 0.0)
+            if dropout_before_resume > 0.0:
+                reset_lora_weights_percentage(model, dropout_before_resume)
+
+        # Apply learning rate from config file
+        config_lr = config.get('optimizer', {}).get('lr', None)
+        if config_lr is not None:
+            old_lr = optimizer.param_groups[0]['lr']
+            for pg in optimizer.param_groups:
+                pg['lr'] = config_lr
+            if is_main_process():
+                print(f'Overriding learning rate (config file): {old_lr} -> {config_lr}')
+
     if 'force_constant_lr' in config:
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
         for pg in optimizer.param_groups:
@@ -840,6 +1171,8 @@ if __name__ == '__main__':
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.eval()
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
@@ -847,12 +1180,17 @@ if __name__ == '__main__':
     num_steps = 0
     empty_cuda_cache()
     while True:
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.train()
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         loss = model_engine.train_batch(iterator).item()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.eval()
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
         finished_epoch = True if new_epoch != epoch else False
@@ -870,6 +1208,13 @@ if __name__ == '__main__':
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
+            if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+                effective_lr, d = get_prodigyplus_schedulefree_lr(optimizer)
+                tb_writer.add_scalar(f'train/lr', effective_lr, x_axis)
+                tb_writer.add_scalar(f'train/prodigy_d', d, x_axis)
+                if wandb_enable:
+                    wandb.log({'train/lr': effective_lr, 'step': x_axis})
+                    wandb.log({'train/prodigy_d': d, 'step': x_axis})
             if optimizer.__class__.__name__ in ('Automagic', 'GenericOptim'):
                 lrs, avg_lr = _get_automagic_lrs(optimizer)
                 if avg_lr > 0:
