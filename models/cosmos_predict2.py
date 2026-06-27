@@ -105,8 +105,8 @@ def vae_encode(tensor, vae):
 
 def get_dit_config(state_dict, key_prefix=''):
     dit_config = {}
-    dit_config["max_img_h"] = 512
-    dit_config["max_img_w"] = 512
+    dit_config["max_img_h"] = 1024
+    dit_config["max_img_w"] = 1024
     dit_config["max_frames"] = 128
     concat_padding_mask = True
     dit_config["in_channels"] = (state_dict['{}x_embedder.proj.1.weight'.format(key_prefix)].shape[1] // 4) - int(concat_padding_mask)
@@ -154,7 +154,7 @@ def get_dit_config(state_dict, key_prefix=''):
 
 
 def _tokenize(tokenizer, prompts):
-    return tokenizer.batch_encode_plus(
+    return tokenizer(
         prompts,
         return_tensors="pt",
         truncation=True,
@@ -494,9 +494,10 @@ class CosmosPredict2Pipeline(BasePipeline):
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                if 'huber_delta' in self.config:
+                    loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+                elif 'smooth_l1_beta' in self.config:
+                    loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
@@ -550,7 +551,7 @@ class InitialLayer(nn.Module):
         else:
             with torch.no_grad():
                 input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
-                crossattn_emb = _compute_text_embeddings(self.text_encoder[0], input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
+                crossattn_emb = _compute_text_embeddings(self.text_encoder, input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
 
         padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(

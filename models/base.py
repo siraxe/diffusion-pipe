@@ -16,12 +16,18 @@ import torchvision
 from PIL import Image, ImageOps
 from torchvision import transforms
 import imageio
+import accelerate
+from diffusers import FlowMatchEulerDiscreteScheduler
+from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
+from comfy.sd1_clip import SD1Tokenizer
 from comfy import model_management
+# Avoids using comfy_kitchen RoPE implementations that don't have backward defined
+model_management.in_training = True
 
 
 def make_contiguous(*tensors):
@@ -160,22 +166,56 @@ class PreprocessMediaFile:
             return [(video, mask) for video in videos]
 
 
-class BasePipeline:
+# shared functionality between BasePipeline and ComfyPipeline
+class CommonPipeline:
     framerate = None
     pixels_round_to_multiple = 16
+    keep_in_high_precision = []
+    spatial_compression = 8
+    channels = 16
+    is_video_vae = False
 
-    def load_diffusion_model(self):
-        pass
+    def __init__(self, *args, **kwargs):
+        # sampling only
+        self.sample_steps = 20
+        self.sample_shift = 3
+        self.scheduler = FlowMatchEulerDiscreteScheduler(shift=self.sample_shift)
+        sigmas = torch.linspace(1.0, 1 / self.sample_steps, self.sample_steps)
+        self.scheduler.set_timesteps(sigmas=sigmas, device='cuda')
 
-    def get_vae(self):
-        raise NotImplementedError()
+    @torch.no_grad()
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def prepare_sample_test(self, prompt, negative_prompt='', cfg=1):
+        inputs = {}
+        inputs_uncond = {}
+        for te in self.get_text_encoders():
+            if isinstance(te, nn.Module):
+                te = te.to('cuda')
+            else:
+                te.load_model_if_needed()
+            call_text_encoder_fn = self.get_call_text_encoder_fn(te)
+            inputs.update(call_text_encoder_fn([prompt], is_video=[False]))
+            if cfg > 1:
+                inputs_uncond.update(call_text_encoder_fn([negative_prompt], is_video=[False]))
+            if isinstance(te, nn.Module):
+                te = te.to('cpu')
+            else:
+                model_management.unload_all_models()
+        self.conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
+        if cfg > 1:
+            self.unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
+        self.sample_cfg = cfg
 
-    def get_text_encoders(self):
-        raise NotImplementedError()
+    def get_call_vae_fn(self, vae):
+        def fn(images):
+            images = images.to('cuda', self.dtype)
+            latents = self.vae_encode(images)
+            return {'latents': latents}
+        return fn
 
-    def configure_adapter(self, adapter_config):
+    def configure_adapter(self, target_model, adapter_config):
         target_linear_modules = set()
-        for name, module in self.transformer.named_modules():
+        for name, module in target_model.named_modules():
             if module.__class__.__name__ not in self.adapter_target_modules:
                 continue
             for full_submodule_name, submodule in module.named_modules(prefix=name):
@@ -190,18 +230,82 @@ class BasePipeline:
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
-                target_modules=target_linear_modules
+                target_modules=target_linear_modules,
+            )
+        elif adapter_type == 'lokr':
+            peft_config = peft.LoKrConfig(
+                r=adapter_config['rank'],
+                decompose_factor=adapter_config['decompose_factor'],
+                alpha=adapter_config['alpha'],
+                rank_dropout=adapter_config['rank_dropout'],
+                target_modules=target_linear_modules,
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
         self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(self.transformer, peft_config)
+        self.lora_model = peft.get_peft_model(target_model, peft_config)
         if is_main_process():
             self.lora_model.print_trainable_parameters()
-        for name, p in self.transformer.named_parameters():
+        for name, p in target_model.named_parameters():
             p.original_name = name
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
+
+        # Better init for LoKr, avoids very small starting gradients that takes a long time to recover from.
+        # TODO: decide if we want to do this
+        # for name, p in self.lora_model.named_parameters():
+        #     if 'lokr_w1.' in name:
+        #         nn.init.ones_(p)
+        #     elif 'lokr_w2.' in name:
+        #         nn.init.zeros_(p)
+
+    @torch.no_grad()
+    def sample(self, w=512, h=512):
+        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
+        if self.is_video_vae:
+            x = x.unsqueeze(2)
+        timesteps = self.scheduler.timesteps
+        for i, step in enumerate(tqdm(timesteps, desc='Sampling')):
+            t = step / 1000
+            t = t.float().view(1)
+            inputs = (x, t, *self.conds)
+            v = self.pipeline_model(inputs).float()
+            if self.sample_cfg > 1:
+                inputs_uncond = (x, t, *self.unconds)
+                v_uncond = self.pipeline_model(inputs_uncond).float()
+                v = v_uncond + self.sample_cfg*(v - v_uncond)
+            x = self.scheduler.step(v, step, x, return_dict=False)[0]
+        vae = self.get_vae()
+        if isinstance(vae, nn.Module):
+            vae = vae.to('cuda')
+        else:
+            vae.load_model_if_needed()
+        img = self.vae_decode(x)
+        if isinstance(vae, nn.Module):
+            vae = vae.to('cpu')
+        else:
+            model_management.unload_all_models()
+        if img.ndim == 5:
+            # in case of video VAE
+            img = img.squeeze(1)
+        return img
+
+
+class BasePipeline(CommonPipeline):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def load_diffusion_model(self):
+        pass
+
+    def get_vae(self):
+        raise NotImplementedError()
+
+    def get_text_encoders(self):
+        raise NotImplementedError()
+
+    def configure_adapter(self, adapter_config):
+        super().configure_adapter(self.transformer, adapter_config)
 
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
@@ -239,9 +343,6 @@ class BasePipeline:
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=False)
 
-    def get_call_vae_fn(self, vae):
-        raise NotImplementedError()
-
     def get_call_text_encoder_fn(self, text_encoder):
         raise NotImplementedError()
 
@@ -266,9 +367,10 @@ class BasePipeline:
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                if 'huber_delta' in self.config:
+                    loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+                elif 'smooth_l1_beta' in self.config:
+                    loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
@@ -362,14 +464,22 @@ class ModelWrapper:
             self._model = self._load_fn()
 
 
-class ComfyPipeline:
-    framerate = None
-    pixels_round_to_multiple = 16
-    keep_in_high_precision = []
+def tokenize_with_weights(self, text:str, return_word_ids=False, **kwargs):
+    kwargs['disable_weights'] = True
+    out = {}
+    out[self.clip_name] = getattr(self, self.clip).tokenize_with_weights(text, return_word_ids, **kwargs)
+    return out
+# patch to always disable weights, even if the child class doesn't
+SD1Tokenizer.tokenize_with_weights = tokenize_with_weights
 
+
+class ComfyPipeline(CommonPipeline):
     def __init__(self, config):
+        super().__init__()
         self.config = config
         self.model_config = self.config['model']
+        self.dtype = self.model_config['dtype']
+        self.latent_format = None
 
         # VAE
         def load_fn():
@@ -411,32 +521,59 @@ class ComfyPipeline:
             clip_type = getattr(comfy.sd.CLIPType, te_config['type'].upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
 
             def load_fn():
-                return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type)
+                return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type, disable_dynamic=True)
 
             self.text_encoders.append(ModelWrapper(load_fn))
+
+    def dequantize(self, model, diffusion_model_dtype):
+        operations = comfy.ops.disable_weight_init
+        for mod_name, module in model.named_children():
+            is_quantized = False
+            for p_name, p in module.named_parameters(recurse=False):
+                if p.__class__.__name__ == 'QuantizedTensor':
+                    module.register_parameter(p_name, nn.Parameter(p.dequantize()))
+                    p = getattr(module, p_name)
+                    is_quantized = True
+
+                name = f'{mod_name}.{p_name}'
+                if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
+                    continue
+                p.data = p.data.to(diffusion_model_dtype)
+
+            if is_quantized:
+                bias = module.bias is not None
+                with accelerate.init_empty_weights():
+                    new_linear = operations.Linear(module.in_features, module.out_features, bias=bias)
+                    new_linear.comfy_cast_weights = True  # model_patcher.set_model_compute_dtype() would normally set this
+                new_linear.weight = module.weight
+                if bias:
+                    new_linear.bias = module.bias
+                model._modules[mod_name] = new_linear
+
+            if len(list(module.children())) > 0:
+                self.dequantize(module, diffusion_model_dtype)
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         model_options = {}
         model_options['dtype'] = dtype
-        self.model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options)
+        model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options, disable_dynamic=True)
 
         for adapter_path in self.model_config.get('merge_adapters', []):
             if is_main_process():
                 print(f'Merging adapter {adapter_path}')
             sd = comfy.utils.load_torch_file(adapter_path, safe_load=True)
-            self.model_patcher, _ = comfy.sd.load_lora_for_models(self.model_patcher, None, sd, 1.0, 0.0)
+            model_patcher, _ = comfy.sd.load_lora_for_models(model_patcher, None, sd, 1.0, 0.0)
+            del sd
 
-        self.model_patcher.set_model_compute_dtype(dtype)
+        model_patcher.set_model_compute_dtype(dtype)
         with torch.no_grad():
-            self.model_patcher.patch_model()
-        self.diffusion_model = self.model_patcher.model.diffusion_model
+            model_patcher.patch_model()
+        self.diffusion_model = model_patcher.model.diffusion_model
+        self.model_patcher = model_patcher
 
         diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
-        for name, p in self.diffusion_model.named_parameters():
-            if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
-                continue
-            p.data = p.data.to(diffusion_model_dtype)
+        self.dequantize(self.diffusion_model, diffusion_model_dtype)
 
         self.diffusion_model.train()
         for name, p in self.diffusion_model.named_parameters():
@@ -449,35 +586,25 @@ class ComfyPipeline:
     def get_text_encoders(self):
         return self.text_encoders
 
-    def configure_adapter(self, adapter_config):
-        target_linear_modules = set()
-        for name, module in self.diffusion_model.named_modules():
-            if module.__class__.__name__ not in self.adapter_target_modules:
-                continue
-            for full_submodule_name, submodule in module.named_modules(prefix=name):
-                if isinstance(submodule, nn.Linear):
-                    target_linear_modules.add(full_submodule_name)
-        target_linear_modules = list(target_linear_modules)
+    def vae_encode(self, img):
+        # move channel dim to end
+        # works for both images (b c h w) and video (b c f h w)
+        img = img.movedim(1, -1)
+        # Pixels are in range [-1, 1], Comfy code expects [0, 1]
+        img = (img + 1) / 2
+        latents = self.vae.encode(img)
+        if self.latent_format is not None:
+            # some older models do this in prepare_inputs() so it can be None
+            latents = self.latent_format.process_in(latents)
+        return latents
 
-        adapter_type = adapter_config['type']
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=adapter_config['rank'],
-                lora_alpha=adapter_config['alpha'],
-                lora_dropout=adapter_config['dropout'],
-                bias='none',
-                target_modules=target_linear_modules
-            )
-        else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(self.diffusion_model, peft_config)
-        if is_main_process():
-            self.lora_model.print_trainable_parameters()
-        for name, p in self.diffusion_model.named_parameters():
-            p.original_name = name
-            if p.requires_grad:
-                p.data = p.data.to(adapter_config['dtype'])
+    def vae_decode(self, latents):
+        if self.latent_format is not None:
+            latents = self.latent_format.process_out(latents)
+        return self.vae.decode(latents)
+
+    def configure_adapter(self, adapter_config):
+        super().configure_adapter(self.diffusion_model, adapter_config)
 
     def save_adapter(self, save_dir, sd):
         self.peft_config.save_pretrained(save_dir)
@@ -515,19 +642,6 @@ class ComfyPipeline:
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=False)
 
-    def get_call_vae_fn(self, vae):
-        @torch.inference_mode()
-        def fn(images):
-            images = images.to('cuda')
-            # move channel dim to end
-            # works for both images (b c h w) and video (b c f h w)
-            images = images.movedim(1, -1)
-            # Pixels are in range [-1, 1], Comfy code expects [0, 1]
-            images = (images + 1) / 2
-            latents = vae.encode(images)
-            return {'latents': latents}
-        return fn
-
     def get_call_text_encoder_fn(self, text_encoder):
         te_idx = None
         for i, te in enumerate(self.text_encoders):
@@ -540,6 +654,7 @@ class ComfyPipeline:
         @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
+            original_min_length = tokenizer.min_length
 
             max_length = 0
             for text in captions:
@@ -558,9 +673,15 @@ class ComfyPipeline:
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 
-            text_embeds = o[0][0]
+            text_embeds = o[0][0].to(self.dtype)
             extra = o[0][1]
-            attention_mask = extra['attention_mask']
+            if 'attention_mask' in extra:
+                attention_mask = extra['attention_mask']
+            else:
+                # Krea2 (maybe others) removes attention_mask if it is all 1s (e.g. batch size 1)
+                attention_mask = torch.ones(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
+
+            tokenizer.min_length = original_min_length
             return {
                 f'text_embeds_{te_idx}': text_embeds,
                 f'attention_mask_{te_idx}': attention_mask,
@@ -589,9 +710,10 @@ class ComfyPipeline:
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                if 'huber_delta' in self.config:
+                    loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+                elif 'smooth_l1_beta' in self.config:
+                    loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
