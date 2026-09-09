@@ -522,8 +522,7 @@ class InitialLayer(nn.Module):
         if layout is None or layout.signature != (text_len, latent_t, lat_h, lat_w, audio_t):
             layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
                                   keyframes=payload.get("keyframes"),
-                                  refs=payload.get("refs"),
-                                  frame_count=payload.get("frame_count"))
+                                  refs=payload.get("refs"))
 
         # model_base passes model_sampling.timestep(sigma) = sigma * 1000
         shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
