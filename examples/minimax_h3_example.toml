@@ -49,7 +49,8 @@ shift = 8  # experiment with this
 image_shift = 1  # 1, or slightly higher than 1, seems good for images
 # CFG-augmented training to preserve distillation. Use either this or a training adapter (not both).
 cfg = 4
-#merge_adapters = ['/path/to/hypothetical/training_adapter.safetensors']  # merges adapters into weights before training starts
+# This adapter works very well for image training (and maybe even video, less tested): https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter
+#merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
 
 [adapter]
 type = 'lora'
