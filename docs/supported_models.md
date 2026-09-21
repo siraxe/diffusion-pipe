@@ -28,6 +28,7 @@
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
+|Qwen-Image 2.1  |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -406,6 +407,29 @@ Configuring and training Qwen-Image-Edit is the same as Flux-Kontext. See the [e
 The model is taking larger inputs than T2I training, so it is slower and uses more VRAM. I don't know if you can train it on 24GB VRAM. Maybe if you block swap enough.
 
 Qwen-Image-Edit LoRAs are saved in ComfyUI format.
+
+## Qwen-Image 2.1
+Uses the ComfyUI backend (unlike Qwen-Image 1.0, which loads via Diffusers), so all model files come from the [Comfy-Org repack](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) and LoRAs are saved in native ComfyUI format.
+```
+[model]
+type = 'qwen_image_2_1'
+diffusion_model = '/data/imagegen_models/comfyui-models/qwen_image_2_1_bf16.safetensors'
+vae = '/data/imagegen_models/comfyui-models/qwen_image_vae_2_1_bf16.safetensors'
+text_encoders = [
+    {path = '/data/imagegen_models/comfyui-models/qwen3vl_8b_bf16.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'  # or leave out to keep bf16; int8 checkpoints also work
+timestep_sample_method = 'logit_normal'
+```
+
+The model does text-to-image and editing with a single checkpoint: give the dataset a `control_path` (same setup as Flux-Kontext / Qwen-Image-Edit, see the [example dataset config](../examples/flux_kontext_dataset.toml)) and the reference images are passed through the Qwen3-VL text encoder and spliced into the transformer sequence as VAE latents. Reference images are resized to the target image's size bucket, so they should have approximately the same aspect ratio as the targets. Editing training needs more VRAM than T2I because the sequence contains both images.
+
+The timestep shift matches the Qwen-Image 2.1 scheduler (0.5 at 256 image tokens to 0.9 at 8192, i.e. 0.69 at 1024x1024) and is applied automatically. It can be overridden with `shift` or disabled with `disable_shift = true`.
+
+You will likely need block swapping (`blocks_to_swap`, max 30) plus expandable segments for 24GB VRAM; see the [example 24GB VRAM config](../examples/qwen_image_2_1.toml). Caption dropout is not supported for edit datasets (the reference images are dropped from the whole batch when the conditioning would mix dropped and undropped captions).
+
+The model was trained guidance-free, so use cfg = 1 when sampling.
 
 ## HunyuanImage-2.1
 Use ComfyUI compatible model files.

@@ -756,9 +756,10 @@ class ComfyPipeline(CommonPipeline):
                 tokens = text_encoder.tokenize(text)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for v in tokens.values():
-                    L = len(v[0])
-                    max_length = max(max_length, L)
-                    token_lengths[i] = L
+                    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+                        L = len(v[0])
+                        max_length = max(max_length, L)
+                        token_lengths[i] = L
 
             # Pad to max length in the batch. We need to do this ourselves or the ComfyUI backend code will fail (it concats tensors assumed to be the same length).
             tokenizer.min_length = max_length
@@ -766,9 +767,13 @@ class ComfyPipeline(CommonPipeline):
             for text in captions:
                 tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
-                    token_list = v[0]
-                    maybe_pad(token_list, max_length, tokenizer)  # some tokenizers don't listen to min_length
-                    tokens_dict[k].append(token_list)
+                    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+                        token_list = v[0]
+                        maybe_pad(token_list, max_length, tokenizer)  # some tokenizers don't listen to min_length
+                        tokens_dict[k].append(token_list)
+                    else:
+                        # Pass through non-list values (e.g. booleans or other metadata) as-is
+                        tokens_dict[k].append(v)
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 

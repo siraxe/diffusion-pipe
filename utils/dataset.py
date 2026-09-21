@@ -1125,7 +1125,10 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
             control_file = example['control_file'] if 'control_file' in example else None
-            queue.put((text_encoder_idx+1, example['caption'], example['is_video'], control_file, child_conn))
+            # Size bucket the image was cached at, so models that condition on reference images can
+            # resize them to the same resolution the VAE-cached control latents were encoded at.
+            size_bucket = example['size_bucket'] if 'size_bucket' in example else None
+            queue.put((text_encoder_idx+1, example['caption'], example['is_video'], control_file, size_bucket, child_conn))
             result = parent_conn.recv()  # dict
             result['image_spec'] = example['image_spec']
             return result
@@ -1148,7 +1151,11 @@ class DatasetManager:
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
         self.te_fn_requires_control_file = [
-            len(signature(fn).parameters) == 3
+            'control_file' in signature(fn).parameters
+            for fn in self.call_text_encoder_fns
+        ]
+        self.te_fn_requires_size_bucket = [
+            'size_bucket' in signature(fn).parameters
             for fn in self.call_text_encoder_fns
         ]
         self.regenerate_cache = regenerate_cache
@@ -1250,11 +1257,13 @@ class DatasetManager:
             else:
                 results = self.call_vae_fn(tensor, **kwargs)
         elif id > 0:
-            caption, is_video, control_file, pipe = task[1:]
+            caption, is_video, control_file, size_bucket, pipe = task[1:]
             args = [caption, is_video]
             idx = id - 1
             if self.te_fn_requires_control_file[idx]:
                 args.append(control_file)
+            if self.te_fn_requires_size_bucket[idx]:
+                args.append(size_bucket)
             results = self.call_text_encoder_fns[idx](*args)
         else:
             raise RuntimeError()
