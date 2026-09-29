@@ -413,9 +413,12 @@ class ARBucketDataset:
     def get_size_bucket_datasets(self):
         return self.size_buckets
 
-    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
-        print(f'caching latents: {self.ar_frames}')
-
+    def _ensure_size_bucket_datasets(self, regenerate_cache=False, trust_cache=False):
+        # Create the per-resolution SizeBucketDatasets (with the size_bucket
+        # column added to the metadata) if they don't exist yet. Normally done
+        # in cache_latents; text embedding caching may need them first.
+        if self.size_buckets:
+            return
         for res in self.resolutions:
             area = res**2
             w = math.sqrt(area * self.ar_frames[0])
@@ -435,14 +438,31 @@ class ARBucketDataset:
                 SizeBucketDataset(metadata_with_size_bucket, self.directory_config, naming_size_bucket, self.cache_base, self.directory_dataset)
             )
 
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
+        print(f'caching latents: {self.ar_frames}')
+
+        self._ensure_size_bucket_datasets(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+
         for ds in self.size_buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.ar_frames}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
-        for size_bucket_dataset in self.size_buckets:
-            size_bucket_dataset.add_text_embedding_dataset(te_dataset)
+        self._ensure_size_bucket_datasets(regenerate_cache=regenerate_cache, trust_cache=True)
+        if getattr(self.directory_dataset, 'te_fn_requires_size_bucket', False):
+            # The model's text encoder fn needs the size_bucket (e.g. Qwen-Image 2.1
+            # edit training, which resizes reference images to the target's bucket
+            # before tokenization). The shared AR-bucket metadata has no size_bucket
+            # column, so cache text embeddings per resolution instead.
+            for size_bucket_dataset in self.size_buckets:
+                te_dataset = _cache_text_embeddings(size_bucket_dataset.metadata_dataset, map_fn, i, size_bucket_dataset.cache_dir, regenerate_cache, caching_batch_size)
+                size_bucket_dataset.add_text_embedding_dataset(te_dataset)
+        else:
+            # Text embeddings are resolution-independent: cache once, share across
+            # all resolutions.
+            te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+            for size_bucket_dataset in self.size_buckets:
+                size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
 class DirectoryDataset:
@@ -1166,6 +1186,15 @@ class DatasetManager:
 
     def register(self, dataset):
         self.datasets.append(dataset)
+        # Let datasets know whether the model's text encoder fns need a size_bucket
+        # (e.g. Qwen-Image 2.1 edit training): those need per-resolution text
+        # embedding caches that include the size_bucket column. Set it on the
+        # top-level Dataset AND its DirectoryDatasets (ARBucketDataset reads it
+        # from the latter).
+        flag = any(self.te_fn_requires_size_bucket)
+        dataset.te_fn_requires_size_bucket = flag
+        for directory_dataset in getattr(dataset, 'directory_datasets', []):
+            directory_dataset.te_fn_requires_size_bucket = flag
 
     # Some notes for myself:
     # Use the third-party multiprocess library because HF Datasets uses it for the map() calls.

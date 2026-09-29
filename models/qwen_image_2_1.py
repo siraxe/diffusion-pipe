@@ -15,8 +15,15 @@ import comfy.latent_formats
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.qwen_image21.model import _split_rows
 
-# Default guidance scale for Qwen-Image 2.1 (used for both training CFG and sampling).
-# Override via model_config: cfg= (training) or guidance_scale= (sampling).
+# Defaults for Qwen-Image 2.1. Training defaults to plain conditional flow matching (cfg = 1, the
+# ai-toolkit-style default); sampling defaults to guidance 3.0. Override via model_config:
+# cfg= (training) or guidance_scale= (sampling). Note: if you train with cfg > 1 (embedded CFG
+# distillation), sample the resulting adapter at guidance 1.0 instead, or guidance is applied twice.
+# When a training adapter is in use ([model] adapter = '...' or merge_adapters, merged into the base
+# weights before training), the defaults drop to 1.0 for both: a merged-in adapter (e.g. a
+# CFG-distilled one) already embeds guidance, so both training and sampling run guidance-free unless
+# cfg=/guidance_scale= is set explicitly.
+DEFAULT_CFG_SCALE = 3.0
 DEFAULT_GUIDANCE_SCALE = 3.0
 
 # Monkey-patch _gated_residual to avoid in-place operation on views of leaf variables
@@ -54,7 +61,20 @@ class QwenImage21Pipeline(ComfyPipeline):
         self.latent_format = comfy.latent_formats.QwenImage21()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
-        self.cfg = self.model_config.get('cfg', DEFAULT_GUIDANCE_SCALE)
+        # Optional training adapter ([model] adapter = '...' , a single Comfy-format LoRA file).
+        # It is merged into the base weights before training, like merge_adapters. (Must happen here,
+        # before train.py calls load_diffusion_model(), which consumes merge_adapters.)
+        adapter = self.model_config.get('adapter', None)
+        if adapter:
+            merge_adapters = self.model_config.setdefault('merge_adapters', [])
+            if adapter not in merge_adapters:
+                merge_adapters.append(adapter)
+        self.has_training_adapter = bool(self.model_config.get('merge_adapters', []))
+
+        # A merged-in training adapter (e.g. a CFG-distilled one) already embeds guidance, so
+        # default cfg to 1.0 in that case to avoid double guidance. Explicit cfg= still wins.
+        default_cfg = 1.0 if self.has_training_adapter else DEFAULT_CFG_SCALE
+        self.cfg = self.model_config.get('cfg', default_cfg)
         if self.cfg > 1:
             # Because uncond branch is no_grad() but tensors passed between pipeline parallel layers must require grad.
             assert self.config['pipeline_stages'] == 1, 'CFG training requires pipeline_stages=1'
@@ -98,10 +118,12 @@ class QwenImage21Pipeline(ComfyPipeline):
 
         Qwen-Image 2.1 is trained with CFG and benefits from a guidance scale of
         ~3.0 for best quality. The base class defaults to cfg=1 (no guidance),
-        which produces washed-out results.
+        which produces washed-out results. When a training adapter is merged in
+        (already embeds guidance), default to guidance 1.0 instead.
         """
         if cfg is None:
-            cfg = self.model_config.get('guidance_scale', DEFAULT_GUIDANCE_SCALE)
+            default_guidance = 1.0 if self.has_training_adapter else DEFAULT_GUIDANCE_SCALE
+            cfg = self.model_config.get('guidance_scale', default_guidance)
         super().prepare_sample_test(prompt, negative_prompt, cfg)
 
     # ------------------------------------------------------------------
