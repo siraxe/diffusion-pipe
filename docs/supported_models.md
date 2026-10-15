@@ -540,6 +540,34 @@ Notes:
 
 LoRAs are saved in ComfyUI format.
 
+## Flux 3
+```
+[model]
+type = 'flux3'
+diffusion_model = '/data2/imagegen_models/comfyui-models/flux3-base.safetensors'
+vae = '/home/anon/ComfyUI/models/vae/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_4b.safetensors', type = 'flux3'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+# Matches the official sampling settings (ComfyUI: shift = ln(6.93) = 1.93586).
+shift = 6.93
+# Text is padded/truncated to this length (must be a multiple of 80, rounded up automatically).
+# Lower it if your captions are short and you want to save some VRAM/compute.
+#text_length = 640
+```
+
+Notes:
+- Use the ComfyUI version of the model, with the **base model** (not the step-distilled flow-map version). Flow-map checkpoints are detected and rejected at startup.
+- Uses the Flux2 VAE and the Qwen3-VL-4B text encoder (different TE than both Flux2 versions). The text encoder file must be loaded with `type = 'flux3'`, not `type = 'flux2'`.
+- Captions are tokenized, padded to `text_length` (default 640) and truncated if longer. Only the first 640 tokens are used.
+- Edit training with a reference image works the same as Flux2 (see the [example dataset config](../examples/flux_kontext_dataset.toml)); the reference image has to have the same size as the target image.
+- Keep the `keep_in_high_precision` layers in mind if you change `diffusion_model_dtype`: the small projections and modulations stay in `dtype`.
+
+LoRAs are saved in ComfyUI format.
+
 ## Anima
 ```
 [model]

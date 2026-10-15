@@ -363,6 +363,9 @@ if __name__ == '__main__':
     elif model_type == 'flux2':
         from models import flux2
         model = flux2.Flux2Pipeline(config)
+    elif model_type == 'flux3':
+        from models import flux3
+        model = flux3.Flux3Pipeline(config)
     elif model_type == 'ernie_image':
         from models import ernie_image
         model = ernie_image.ErnieImagePipeline(config)
