@@ -30,8 +30,11 @@ from . import reduction
 import hyvideo.text_encoder
 from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
-from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod
+import comfy.ops
+from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod, modulated_norm
 from comfy.ldm.flux.math import attention
+from comfy.ldm.flux3.model import Block as Flux3Block
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
@@ -431,6 +434,34 @@ def single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=No
     return x
 
 
+def flux3_block_forward(self, x: Tensor, spans, pe: Tensor, transformer_options={}) -> Tensor:
+    # spans: (start, end, ModulationOut) row ranges; the first modulates every row, the others redo their rows
+    B, N, _ = x.shape
+    mod = spans[0][2]
+    x_mod = modulated_norm(x, self.pre_norm, mod.scale, mod.shift)
+    for start, end, mod in spans[1:]:
+        x_mod[:, start:end] = modulated_norm(x[:, start:end], self.pre_norm, mod.scale, mod.shift)
+
+    if self.fused_qkv:
+        q, k, v = self.qkv(x_mod).chunk(3, dim=-1)
+    else:
+        q, k, v = self.q_proj(x_mod), self.k_proj(x_mod), self.v_proj(x_mod)
+    mlp = self.mlp_in(x_mod)
+    del x_mod
+    q, k = self.norm(q.view(B, N, self.num_heads, -1), k.view(B, N, self.num_heads, -1), pe)
+    q, k, v = AttentionTensorContainer(q.flatten(2)), AttentionTensorContainer(k.flatten(2)), AttentionTensorContainer(v)
+    out = self.attn_out(optimized_attention(q, k, v, self.num_heads, transformer_options=transformer_options, preferred_attention=self.comfy_attention))
+    # attention + MLP sum folded into the mlp_out GEMM epilogue
+    out = comfy.ops.linear_input_act(self.mlp_out, mlp, "swiglu", residual=out, residual_scale=out.new_ones(out.shape[-1]))
+    del mlp
+
+    # The only change from comfy.ldm.flux3.model.Block.forward: keep the gate accumulation out of place.
+    # The upstream loop does x[:, s:e].addcmul_(out[:, s:e], mod.gate), which autograd rejects because
+    # x was saved for backward by the norms above (stale saved tensor / version counter error).
+    outs = [x[:, s:e] + out[:, s:e] * m.gate for s, e, m in spans]
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -468,3 +499,7 @@ def apply_patches():
     # Fix training issues caused by in-place tensor modification and backward pass (+= operations).
     DoubleStreamBlock.forward = double_stream_forward
     SingleStreamBlock.forward = single_stream_forward
+
+    # Same in-place issue in comfy.ldm.flux3.model.Block.forward (gate fold mutates x after it was
+    # saved for backward). models/flux3.py calls the blocks directly and relies on this replacement.
+    Flux3Block.forward = flux3_block_forward

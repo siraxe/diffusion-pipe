@@ -11,45 +11,14 @@ import safetensors
 from diffusers import FlowMatchEulerDiscreteScheduler
 
 import comfy.latent_formats
-from comfy.ldm.flux.layers import ModulationOut, modulated_norm, timestep_embedding
-from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+from comfy.ldm.flux.layers import ModulationOut, timestep_embedding
 
 from models.base import ComfyPipeline, make_contiguous, maybe_pad
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 
-
-# Out-of-place reimplementation of comfy.ldm.flux3.model.Block.forward.
-# The ComfyUI implementation folds the gate into the block input with in-place ops, which autograd
-# cannot backprop through (it raises "a variable needed for gradient computation has been modified
-# by an inplace operation"), so this version keeps every operation out-of-place.
-def run_flux3_block(layer, x, spans, pe):
-    # spans: contiguous (start, end, ModulationOut) row ranges covering the whole sequence
-    B, N, _ = x.shape
-    if len(spans) == 1:
-        mod = spans[0][2]
-        x_mod = modulated_norm(x, layer.pre_norm, mod.scale, mod.shift)
-    else:
-        x_mod = torch.cat([modulated_norm(x[:, s:e], layer.pre_norm, mod.scale, mod.shift) for s, e, mod in spans], dim=1)
-
-    if layer.fused_qkv:
-        q, k, v = layer.qkv(x_mod).chunk(3, dim=-1)
-    else:
-        q, k, v = layer.q_proj(x_mod), layer.k_proj(x_mod), layer.v_proj(x_mod)
-    mlp = layer.mlp_in(x_mod)
-
-    q, k = layer.norm(q.view(B, N, layer.num_heads, -1), k.view(B, N, layer.num_heads, -1), pe)
-    q, k, v = AttentionTensorContainer(q.flatten(2)), AttentionTensorContainer(k.flatten(2)), AttentionTensorContainer(v)
-    out = layer.attn_out(optimized_attention(q, k, v, layer.num_heads, transformer_options={}, preferred_attention=layer.comfy_attention))
-
-    # swiglu activation, with the attention output added as a residual (the reference does this inside
-    # the mlp_out GEMM epilogue, linear_input_act, but the plain version is equivalent)
-    gate, up = mlp.chunk(2, dim=-1)
-    out = out + layer.mlp_out(F.silu(gate) * up)
-
-    if len(spans) == 1:
-        return x + out * spans[0][2].gate
-    return torch.cat([x[:, s:e] + out[:, s:e] * mod.gate for s, e, mod in spans], dim=1)
+# The blocks below call self.layer(x, spans, pe) directly. utils/patches.py replaces
+# comfy.ldm.flux3.model.Block.forward with an autograd-safe (out-of-place) version.
 
 
 class Flux3Pipeline(ComfyPipeline):
@@ -372,7 +341,7 @@ class TxtBlockLayer(nn.Module):
         self.offloader.wait_for_block(self.block_idx)
         mod = ModulationOut(em[3], em[4], em[5])
         start = img_len + ref_len
-        txt = run_flux3_block(self.layer, txt, [(0, txt.shape[1], mod)], pe[:, start:start + txt.shape[1]])
+        txt = self.layer(txt, [(0, txt.shape[1], mod)], pe[:, start:start + txt.shape[1]])
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, txt, refs, pe, vec_img, vec_zero, *em, img_len, ref_len, txt_len, hw)
@@ -393,7 +362,7 @@ class RefBlockLayer(nn.Module):
         self.offloader.wait_for_block(self.block_idx)
         if refs.shape[1] > 0:
             mod = ModulationOut(em[6], em[7], em[8])
-            refs = run_flux3_block(self.layer, refs, [(0, refs.shape[1], mod)], pe[:, img_len:img_len + refs.shape[1]])
+            refs = self.layer(refs, [(0, refs.shape[1], mod)], pe[:, img_len:img_len + refs.shape[1]])
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, txt, refs, pe, vec_img, vec_zero, *em, img_len, ref_len, txt_len, hw)
@@ -412,7 +381,7 @@ class ImageBlockLayer(nn.Module):
 
         self.offloader.wait_for_block(self.block_idx)
         mod = ModulationOut(em[0], em[1], em[2])
-        img = run_flux3_block(self.layer, img, [(0, img.shape[1], mod)], pe[:, :img.shape[1]])
+        img = self.layer(img, [(0, img.shape[1], mod)], pe[:, :img.shape[1]])
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, txt, refs, pe, vec_img, vec_zero, *em, img_len, ref_len, txt_len, hw)
@@ -460,7 +429,7 @@ class SingleTransformerLayer(nn.Module):
             (img_len, ref_end, ModulationOut(r_s, r_sc, r_g)),
             (ref_end, ref_end + txt_len, ModulationOut(t_s, t_sc, t_g)),
         ]
-        x = run_flux3_block(self.layer, x, spans, pe)
+        x = self.layer(x, spans, pe)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(x, pe, vec_img, s_s, s_sc, s_g, r_s, r_sc, r_g, t_s, t_sc, t_g, img_len, ref_len, txt_len, hw)
