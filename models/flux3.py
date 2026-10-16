@@ -263,28 +263,18 @@ class Flux3Pipeline(ComfyPipeline):
 class InitialLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
+        # Keep the underlying Flux3 model around for its image_ids/text_ids/rope helpers instead of
+        # copying them. The list wrapper keeps it from being registered as a submodule a second time
+        # (its parameters are already part of the pipeline through the block layers below); same
+        # idiom as models/flux2.py. __getattr__ delegates the helper lookups to it.
+        self.model = [model]
         self.emb_in = model.emb_in
         self.txt_in = model.txt_in
         self.time_in = model.time_in
         self.early_stream_modulations = model.early_stream_modulations
-        self.pe_embedder = model.pe_embedder
-        self.image_rope_scale = model.image_rope_scale
 
-    def _image_ids(self, h, w, index, device):
-        # (t, row, col, l); references are told apart on the l axis
-        ids = torch.zeros(h, w, 4, device=device, dtype=torch.float32)
-        ids[..., 1] = torch.arange(h, device=device, dtype=torch.float32)[:, None] * self.image_rope_scale
-        ids[..., 2] = torch.arange(w, device=device, dtype=torch.float32)[None, :] * self.image_rope_scale
-        ids[..., 3] = index
-        return ids.flatten(0, 1)
-
-    def _text_ids(self, length, device):
-        ids = torch.zeros(length, 4, device=device, dtype=torch.float32)
-        ids[:, 3] = torch.arange(length, device=device, dtype=torch.float32)
-        return ids
-
-    def _rope(self, ids):
-        return self.pe_embedder(ids.unsqueeze(0)).transpose(1, 2).contiguous()
+    def __getattr__(self, name):
+        return getattr(self.model[0], name)
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -296,7 +286,7 @@ class InitialLayer(nn.Module):
         if len(extra) > 0:
             control = extra[0]
             refs = self.emb_in['image_cond'](control.flatten(2).transpose(1, 2))
-            ref_ids = self._image_ids(control.shape[-2], control.shape[-1], -1, device)
+            ref_ids = self.image_ids(control.shape[-2], control.shape[-1], -1, device)
         else:
             refs = img.new_zeros((bs, 0, img.shape[-1]))
             ref_ids = torch.zeros((0, 4), device=device, dtype=torch.float32)
@@ -307,7 +297,7 @@ class InitialLayer(nn.Module):
         vec_img, vec_zero = vec[:-1], vec[-1:]
 
         # per sample the joint sequence is [image, image_cond, text]
-        pe = self._rope(torch.cat([self._image_ids(h, w, 0, device), ref_ids, self._text_ids(txt.shape[1], device)], dim=0))
+        pe = self.rope(torch.cat([self.image_ids(h, w, 0, device), ref_ids, self.text_ids(txt.shape[1], device)], dim=0))
 
         e_img = self.early_stream_modulations['image'](vec_img)[0]
         e_txt = self.early_stream_modulations['txt'](vec_zero)[0]
