@@ -28,7 +28,8 @@
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
-|Qwen-Image 2.1  |✅    |✅              |✅                |
+|Qwen-Image-2.1  |✅    |✅              |✅                |
+|MOSS-Image      |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -675,3 +676,33 @@ cfg = 4
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [MiniMax H3 example TOML](../examples/minimax_h3_example.toml).
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
+
+## Qwen-Image-2.1
+```
+[model]
+type = 'qwen_image21'
+diffusion_model = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_8b_int8_convrot.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+#merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
+```
+Everything is ComfyUI model format. Only T2I is currently supported. I2I edit training would require significant refactors of the dataset processing code (it assumes the text embeddings can be computed from the text prompt alone, which isn't true for this model). Qwen-Image-2.1 is a CFG-distilled model. Training it without a de-distillation adapter breaks the distillation and you will need to use CFG for inference.
+
+## MOSS-Image
+```
+[model]
+type = 'moss_image'
+diffusion_model = '/data2/imagegen_models/comfyui-models/moss_image_base_bf16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3.5_9b_int8_convrot.safetensors', type = 'moss_image'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+shift = 3
+```
+The int8-convrot format will NOT work right for training LoRAs. Loss just goes up sharply. I don't know why; it only happens on this model. You need the full bf16. `diffusion_model_dtype = 'float8'` probably works if you need the VRAM savings, but it will have some quality loss and I haven't tested it. All input models and saved models are in ComfyUI format.

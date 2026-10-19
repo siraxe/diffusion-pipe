@@ -381,6 +381,12 @@ if __name__ == '__main__':
     elif model_type == 'minimax_h3':
         from models import minimax_h3
         model = minimax_h3.MinimaxH3Pipeline(config)
+    elif model_type == 'qwen_image21':
+        from models import qwen_image21
+        model = qwen_image21.QwenImage21Pipeline(config)
+    elif model_type == 'moss_image':
+        from models import moss_image
+        model = moss_image.MossImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -522,7 +528,7 @@ if __name__ == '__main__':
 
     # Free up as much RAM as we can.
     del dataset_manager
-    if config['model'].get('cache_text_embeddings', True):
+    if config['model'].get('cache_text_embeddings', True) and not args.test_sample:
         # Only ComfyUI-based models, and only if we are caching text embeddings (which most models require).
         model.free_vae_and_te()
 

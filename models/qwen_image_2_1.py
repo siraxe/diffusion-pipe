@@ -339,12 +339,18 @@ class QwenImage21Pipeline(ComfyPipeline):
 def make_attn_fn(segments):
     # Mirrors comfy.ldm.qwen_image21.model.block_causal_attention, minus the sampling-only KV cache:
     # one attention call per sequence segment (causal for text, full-attention-to-prefix for images).
-    def attn(q, k, v, heads):
+    def attn(q, k, v, heads, preferred_attention=None):
+        # Newer ComfyUI versions pass single-owner AttentionTensorContainer objects and a
+        # preferred_attention selection through to attn_fn.
+        if hasattr(q, 'take'):
+            q, k, v = q.take(), k.take(), v.take()
         # q, k, v: (B, N, H, D)
-        outs = [
-            optimized_attention(q[:, start:end].flatten(2), k[:, :end].flatten(2), v[:, :end].flatten(2), heads, mask=mask)
-            for start, end, mask in segments
-        ]
+        outs = []
+        for start, end, mask in segments:
+            kwargs = {'mask': mask}
+            if preferred_attention is not None:
+                kwargs['preferred_attention'] = preferred_attention
+            outs.append(optimized_attention(q[:, start:end].flatten(2), k[:, :end].flatten(2), v[:, :end].flatten(2), heads, **kwargs))
         return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
     return attn
 
