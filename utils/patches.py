@@ -34,6 +34,8 @@ import comfy.ops
 from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod, modulated_norm
 from comfy.ldm.flux.math import attention
 from comfy.ldm.flux3.model import Block as Flux3Block
+import comfy.ldm.fibo2.model as fibo2_model
+from comfy.ldm.lumina.model import invert_slices
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 
 
@@ -462,6 +464,31 @@ def flux3_block_forward(self, x: Tensor, spans, pe: Tensor, transformer_options=
     return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
 
+def _fibo2_scale_for_slices(scale, x, timestep_zero_index):
+    # Same semantics as comfy.ldm.lumina.model.modulate's in-place loop, but out of place: the
+    # rows in timestep_zero_index (the noisy image) take the second half of the batch, the rest t = 0.
+    actual_batch = scale.size(0) // 2
+    parts = [(start, end, True) for start, end in timestep_zero_index]
+    parts += [(start, end, False) for start, end in invert_slices(timestep_zero_index, x.shape[1])]
+    parts.sort()
+    return torch.cat([
+        x[:, start:end] * (scale[actual_batch:] if noisy else scale[:actual_batch])
+        for start, end, noisy in parts
+    ], dim=1)
+
+
+def fibo2_modulate(x, scale, timestep_zero_index=None):
+    if timestep_zero_index is None:
+        return x * (1 + scale.unsqueeze(1))
+    return _fibo2_scale_for_slices(1 + scale.unsqueeze(1), x, timestep_zero_index)
+
+
+def fibo2_apply_gate(gate, x, timestep_zero_index=None):
+    if timestep_zero_index is None:
+        return gate * x
+    return _fibo2_scale_for_slices(gate, x, timestep_zero_index)
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -503,3 +530,8 @@ def apply_patches():
     # Same in-place issue in comfy.ldm.flux3.model.Block.forward (gate fold mutates x after it was
     # saved for backward). models/flux3.py calls the blocks directly and relies on this replacement.
     Flux3Block.forward = flux3_block_forward
+
+    # Fibo 2.0's modulate/apply_gate multiply the timestep-zero slices into x in place, which autograd
+    # rejects. models/fibo2.py calls the blocks directly and relies on these replacements.
+    fibo2_model.modulate = fibo2_modulate
+    fibo2_model.apply_gate = fibo2_apply_gate

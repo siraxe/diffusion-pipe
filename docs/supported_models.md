@@ -568,6 +568,37 @@ Notes:
 
 LoRAs are saved in ComfyUI format.
 
+## Fibo 2.0
+```
+[model]
+type = 'fibo2'
+diffusion_model = '/data2/imagegen_models/comfyui-models/fibo2.safetensors'
+vae = '/home/anon/ComfyUI/models/vae/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_4b.safetensors', type = 'fibo2'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+# The official recipe (FIBO paper, Appendix B) is a logit-normal noise schedule with
+# resolution-dependent timestep shifting (SD3-style: mu 0.5..1.15 over 256..4096 image tokens,
+# as in BriaFibo2Pipeline). Uncomment to reproduce it instead of the constant shift below.
+#flux_shift = true
+# ComfyUI hardcodes the 1 MP value of that schedule: mu = 1.15, i.e. exp(1.15) = 3.158.
+#shift = 3.158
+# Optional cap on the cached text length. Leave unset to cache captions at their natural length.
+#text_length = 512
+```
+
+Notes:
+- Uses the Flux2 VAE and the **Qwen3-VL-4B** text encoder. The text encoder file must be loaded with `type = 'fibo2'`.
+- Captions are FIBO's structured JSON captions or plain text. They are cached at their natural length (the text encoder emits six 7680-dim bundles per token, so caching is expensive: about 47MB per 512 tokens) and padded to the longest caption in each batch at training time. `text_length` can be set to truncate long captions and bound the cache size.
+- The text length controls the model's gist token count, so it is not padded to a fixed length the way Flux3 is.
+- Image pair (edit) training works through `control_path` in the dataset config, the same as Flux2/Flux3. The reference image is passed to both the text encoder (as an image the edit instruction refers to) and the DiT (as a clean reference latent), matching ComfyUI's `TextEncodeFibo2` node. The reference image has to have the same size as the target image.
+- If you set `diffusion_model_dtype`, the small projections/modulations listed in `keep_in_high_precision` stay in `dtype`.
+
+LoRAs are saved in ComfyUI format.
+
 ## Anima
 ```
 [model]
