@@ -384,6 +384,9 @@ if __name__ == '__main__':
     elif model_type == 'moss_image':
         from models import moss_image
         model = moss_image.MossImagePipeline(config)
+    elif model_type == 'minimax_h3_image':
+        from models import minimax_h3_image
+        model = minimax_h3_image.MinimaxH3ImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

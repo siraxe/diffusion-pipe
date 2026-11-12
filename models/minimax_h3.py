@@ -262,6 +262,22 @@ class MinimaxH3Pipeline(ComfyPipeline):
             print(f'Loading model on rank {rank}')
             super().load_diffusion_model()
 
+        # Quantized checkpoints embed a per-module comfy_attention.config that
+        # selects inference-only kernels (e.g. comfy_kitchen_int8). Those kernels
+        # run without autograd, which silently detaches every attention output
+        # and freezes all attention LoRA weights. Clear them so attention takes
+        # the regular autograd-capable path.
+        num_disabled = 0
+        disabled_methods = set()
+        for module in self.diffusion_model.modules():
+            if isinstance(module, ComfyAttention) and module.function is not None:
+                disabled_methods.add(module.method)
+                module.function = None
+                module.method = None
+                num_disabled += 1
+        if num_disabled > 0:
+            print(f'Disabled {num_disabled} inference-only attention kernel(s) ({", ".join(map(str, disabled_methods))}) so attention is trainable')
+
     # Override to exclude adaln, since full and pruned model have different sizes. Makes LoRA compatible with both.
     def get_target_modules(self, target_model):
         target_modules = set()

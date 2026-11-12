@@ -1,0 +1,58 @@
+# Will train MiniMax H3 Image LoRAs on 24GB VRAM, and has reasonable defaults.
+
+# FILL IN THESE PATHS
+output_dir = 'path_to_output_dir'
+dataset = 'your_dataset.toml'  # for image edit training, set control_path in the dataset to enable it
+
+# training settings
+epochs = 1000
+micro_batch_size_per_gpu = 1
+image_micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 10
+
+# eval settings
+eval_every_n_epochs = 1
+#eval_every_n_steps = 100
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+# misc settings
+save_every_n_epochs = 1  # use either this or the steps one below
+#save_every_n_steps = 200
+#checkpoint_every_n_epochs = 1
+#checkpoint_every_n_minutes = 120
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+blocks_to_swap = 48  # 48 is max. At 512 res, might be able to lower this a bit to speed things up.
+compile = true
+
+# FILL IN ALL THESE PATHS TOO
+[model]
+type = 'minimax_h3_image'
+diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_image_pruned_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/minimax_h3_image_vae_fp16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+# Training timesteps are drawn from the checkpoint's 6-sigma PDD grid (config override: sigma_grid).
+# No CFG, timestep_sample_method, or shift: the model is guidance-distilled with per-head sigmas.
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

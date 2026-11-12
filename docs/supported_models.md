@@ -683,3 +683,15 @@ timestep_sample_method = 'logit_normal'
 shift = 3
 ```
 The int8-convrot format will NOT work right for training LoRAs. Loss just goes up sharply. I don't know why; it only happens on this model. You need the full bf16. `diffusion_model_dtype = 'float8'` probably works if you need the VRAM savings, but it will have some quality loss and I haven't tested it. All input models and saved models are in ComfyUI format.
+## MiniMax H3 Image
+```
+[model]
+type = 'minimax_h3_image'
+diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_image_pruned_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/minimax_h3_image_vae_fp16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+```
+The Comfy-Org MiniMax-H3-Image model: the H3 DiT without the audio stream, distilled to a 6-step no-CFG text-to-image / image-edit model. Supports both T2I and image edit training (edit datasets use the standard `control_path` mechanism, like Flux Kontext). The checkpoint must be the Comfy-Org repack with its config metadata, since it declares the PDD sigma grid that training timesteps are drawn from (one of the 6 grid sigmas per training step, each fit through its own output head). Each reference image is VAE-encoded at the target's size and packed as a reference block, and also shown to the Qwen3-VL text encoder as a `Picture i:` vision block. CFG is not supported (the model is guidance-distilled), and `timestep_sample_method`/`shift` don't apply for the 6-head checkpoint (only for hypothetical single-head checkpoints). Like the video model, LoRAs exclude the AdaLN weights so they stay compatible with full and pruned checkpoints, and LoRAs can be trained directly on quantized weights.

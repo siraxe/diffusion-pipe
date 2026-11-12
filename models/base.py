@@ -5,6 +5,9 @@ import os
 import sys
 from collections import defaultdict
 import types
+# Import this before the ComfyUI path is added to sys.path: the repo's namespace `utils` package
+# would otherwise be shadowed by ComfyUI's regular `utils` package (PEP 420 regular beats namespace).
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
@@ -20,7 +23,6 @@ import accelerate
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
