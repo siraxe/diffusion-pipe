@@ -109,6 +109,17 @@ class Attention(nn.Module):
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
 comfy.ldm.minimax.model.Attention = Attention
 
+# Keep inference-only attention kernels (embedded in quantized checkpoints as a config
+# buffer, and also present in DeepSpeed resume checkpoints) out of training.
+_orig_comfy_attn_load_from_state_dict = ComfyAttention._load_from_state_dict
+
+def _trainable_comfy_attn_load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    _orig_comfy_attn_load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+    self.function = None
+    self.method = None
+
+ComfyAttention._load_from_state_dict = _trainable_comfy_attn_load_from_state_dict
+
 
 class AdalnProj(nn.Module):
     def __init__(self, t_dim, hidden, expand, modalities, apply_silu=True,

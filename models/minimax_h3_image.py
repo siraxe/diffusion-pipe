@@ -472,7 +472,9 @@ class MinimaxH3ImagePipeline(minimax_h3.MinimaxH3Pipeline):
         else:
             comfy.model_management.unload_all_models()
         if img.ndim == 5:
-            img = img[:, :, 0]
+            # vae_decode returns channels-last [B, T, H, W, C]; drop the frame dim
+            # (same as CommonPipeline.sample, which train.py --test-sample expects)
+            img = img.squeeze(1)
         return img
 
 
