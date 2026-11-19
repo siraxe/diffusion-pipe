@@ -23,7 +23,7 @@ from PIL import Image, ImageOps
 # and the attention-mask-enabled MiniMax Qwen3-VL text encoder.
 from models import minimax_h3
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
-from utils.common import AUTOCAST_DTYPE, round_down_to_multiple
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, round_down_to_multiple
 from utils.offloading import ModelOffloader
 
 import comfy.latent_formats
@@ -38,8 +38,9 @@ from comfy.ldm.minimax.model import (
 FRAMERATE = 24  # only relevant for video files; this pipeline trains single images
 
 # The Comfy-Org MiniMax-H3-Image checkpoint is a 6-step no-CFG distilled model whose PDD output
-# heads were distilled on this sigma grid. The grid is also the training and sampling schedule:
-# each training step draws one of these sigmas and fits it through its own head.
+# heads were distilled on this sigma grid. Training samples timesteps continuously (generic flow
+# matching distribution); a drawn sigma maps to head weights through its containing grid interval.
+# Sampling steps through the grid itself.
 DEFAULT_SIGMA_GRID = [
     1.0,
     0.9675236940383911,
@@ -53,6 +54,53 @@ DEFAULT_SIGMA_GRID = [
 VISION_SHORT_EDGE = 1024
 # picture label used for edit conditioning (no angle brackets, unlike the video archs)
 PICTURE_LABEL = 'Picture %d: '
+
+
+def pdd_grid_span(grid, sigma_v: float, sigma_v_next=None):
+    """Head interval [start, stop) for PDD heads distilled on an explicit
+    decreasing sigma grid (n + 1 points, MiniMax-H3-Image). A sampling step
+    spans the grid points nearest sigma -> sigma_next (ComfyUI's rule); a
+    single training sigma uses the one interval containing it."""
+    n = len(grid) - 1
+    if sigma_v_next is None:
+        start = 0
+        for k in range(n):
+            # tolerance: a float32 sigma sitting on a grid point owns that head
+            if grid[k] >= sigma_v - 1e-5:
+                start = k
+        return start, start + 1
+    start, stop = (
+        min(range(n + 1), key=lambda k: abs(grid[k] - float(s)))
+        for s in (sigma_v, sigma_v_next)
+    )
+    start = min(start, n - 1)
+    return start, max(stop, start + 1)
+
+
+def build_pdd_grid_weights(sigma_v, grid, sigma_v_next=None) -> torch.Tensor:
+    """(B, n) head weights on an explicit sigma grid: head 0 (the full head)
+    at 1, the offset heads a step spans at their normalized dt share."""
+    n = len(grid) - 1
+    rows = []
+    for i in range(len(sigma_v)):
+        nxt = None if sigma_v_next is None else float(sigma_v_next[i])
+        start, stop = pdd_grid_span(grid, float(sigma_v[i]), nxt)
+        dt = [grid[k] - grid[k + 1] for k in range(start, stop)]
+        w = torch.zeros(n, dtype=torch.float64)
+        w[0] = 1.0
+        first = max(start, 1)
+        w[first:stop] = torch.tensor(dt[first - start:], dtype=torch.float64) / sum(dt)
+        rows.append(w)
+    return torch.stack(rows).float()
+
+
+# ref: https://github.com/ostris/ai-toolkit/blob/main/extensions_built_in/diffusion_models/minimax_h3/src/transformer.py
+def _blend_pdd_heads(out: torch.Tensor, weights: torch.Tensor, n: int):
+    """(B, N, n * d) stacked head outputs, (B, n) weights -> (B, N, d)."""
+    b, rows, _ = out.shape
+    return torch.einsum(
+        "brkd,bk->brd", out.view(b, rows, n, -1), weights.to(out.device, out.dtype)
+    )
 
 
 class PreprocessMediaFileMinimaxImage(PreprocessMediaFile):
@@ -376,36 +424,35 @@ class MinimaxH3ImagePipeline(minimax_h3.MinimaxH3Pipeline):
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)
 
-        sigma_grid = self._get_sigma_grid()
-        if sigma_grid is not None:
-            # multi-head (PDD) checkpoint: each head was distilled on its own sigma, so training
-            # draws uniformly from the grid. timestep_sample_method / shift / timestep_quantile
-            # do not apply here.
-            idx = torch.randint(0, len(sigma_grid) - 1, (bs,), device=device)
-            t = torch.tensor(sigma_grid[:-1], device=device, dtype=torch.float32)[idx]
+        # Continuous timestep sampling (matches upstream diffusion-pipe): even multi-head (PDD)
+        # checkpoints train on the generic flow-matching distribution, with the drawn sigma mapped
+        # to head weights through the PDD grid at the output layer.
+        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+        if timestep_sample_method == 'logit_normal':
+            dist = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            dist = torch.distributions.uniform.Uniform(0, 1)
         else:
-            # single-head checkpoint: generic flow-matching timestep sampling
-            timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-            if timestep_sample_method == 'logit_normal':
-                dist = torch.distributions.normal.Normal(0, 1)
-            elif timestep_sample_method == 'uniform':
-                dist = torch.distributions.uniform.Uniform(0, 1)
-            else:
-                raise NotImplementedError()
+            raise NotImplementedError()
 
-            if timestep_quantile is not None:
-                t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
-            else:
-                t = dist.sample((bs,)).to(device)
+        if timestep_quantile is not None:
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
+        else:
+            t = dist.sample((bs,)).to(device)
 
-            if timestep_sample_method == 'logit_normal':
-                sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-                t = t * sigmoid_scale
-                t = torch.sigmoid(t)
+        if timestep_sample_method == 'logit_normal':
+            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+            t = t * sigmoid_scale
+            t = torch.sigmoid(t)
 
-            shift = self.model_config.get('shift', None)
-            if shift:
-                t = (t * shift) / (1 + (shift - 1) * t)
+        shift = self.model_config.get('shift', None)
+        if f == 1:
+            shift = self.model_config.get('image_shift', shift)
+        if shift:
+            t = (t * shift) / (1 + (shift - 1) * t)
+        elif self.model_config.get('flux_shift', False):
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            t = time_shift(mu, 1.0, t)
 
         noise = torch.randn_like(latents)
         t_expanded = t.view(-1, 1, 1, 1, 1)
@@ -416,10 +463,10 @@ class MinimaxH3ImagePipeline(minimax_h3.MinimaxH3Pipeline):
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
-        layers = [InitialLayer(diffusion_model, self._get_sigma_grid())]
+        layers = [InitialLayer(diffusion_model)]
         for i, block in enumerate(diffusion_model.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
-        layers.append(FinalLayer(diffusion_model))
+        layers.append(FinalLayer(diffusion_model, self._get_sigma_grid()))
         return layers
 
     def get_loss_fn(self):
@@ -479,7 +526,7 @@ class MinimaxH3ImagePipeline(minimax_h3.MinimaxH3Pipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, sigma_grid):
+    def __init__(self, model):
         super().__init__()
         if model.use_adaln_curves:
             self.adaln_t_table = model.adaln_t_table
@@ -490,7 +537,6 @@ class InitialLayer(nn.Module):
         self.rope = model.rope
         self.token_refiner = model.token_refiner
         self.model = [model]
-        self.sigma_grid = sigma_grid
         self._cache = {}
 
     def __getattr__(self, name):
@@ -584,24 +630,22 @@ class InitialLayer(nn.Module):
         else:
             t_emb = self.time_embedder(t_vals).to(dtype)
 
-        head_idx = 0
-        if self.sigma_grid is not None:
-            # the sigma this example was noised at maps to exactly one PDD head
-            head_idx = min(range(len(self.sigma_grid) - 1), key=lambda k: abs(self.sigma_grid[k] - sigma))
-
         # pack as ints so we can pass as tensor between pipeline parallel layers
         va, vb, _ = layout.segments[-1]
-        extra_ints = torch.tensor([va, vb, lat_t, lat_h, lat_w, head_idx], dtype=torch.int32, device=device)
+        extra_ints = torch.tensor([va, vb, lat_t, lat_h, lat_w], dtype=torch.int32, device=device)
 
-        return h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints
+        # the exact sigma this example was noised at; the final layer maps it to PDD head weights
+        sigma_v = t.flatten()[0].float().clamp(min=1e-6)
+
+        return h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints, sigma_v
 
     def make_layer_inputs(self, video_x, control_x, t, context, context_mask, text_tags):
-        h_list, attention_mask_list, t_emb_list, mod_row_list, extra_ints_list = [], [], [], [], []
+        h_list, attention_mask_list, t_emb_list, mod_row_list, extra_ints_list, sigma_v_list = [], [], [], [], [], []
         rope_freqs = None
         for i in range(video_x.shape[0]):
             cx = None if control_x is None else control_x[i:i + 1]
             tags = None if text_tags is None or text_tags.numel() == 0 else text_tags[i]
-            h, attention_mask, t_emb, mod_row, rope, extra_ints = self.make_packed_sequence(
+            h, attention_mask, t_emb, mod_row, rope, extra_ints, sigma_v = self.make_packed_sequence(
                 video_x[i:i + 1], cx, t[i:i + 1], context[i:i + 1], context_mask[i], tags)
             if rope_freqs is None:
                 rope_freqs = rope
@@ -610,13 +654,15 @@ class InitialLayer(nn.Module):
             t_emb_list.append(t_emb)
             mod_row_list.append(mod_row)
             extra_ints_list.append(extra_ints)
+            sigma_v_list.append(sigma_v)
 
         h = torch.stack(h_list, dim=0)
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
         mod_row = torch.stack(mod_row_list)
         extra_ints = torch.stack(extra_ints_list)
-        outputs = make_contiguous(h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints)
+        sigma_v = torch.stack(sigma_v_list)
+        outputs = make_contiguous(h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints, sigma_v)
         for item in outputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
@@ -647,7 +693,7 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints, sigma_v = inputs
 
         self.offloader.wait_for_block(self.block_idx)
 
@@ -655,14 +701,15 @@ class TransformerLayer(nn.Module):
 
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints)
+        return make_contiguous(h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints, sigma_v)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, sigma_grid):
         super().__init__()
         self.final_layer = model.final_layer
         self.model = [model]
+        self.sigma_grid = sigma_grid
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
@@ -670,11 +717,10 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_row, rope_freqs, extra_ints, sigma_v = inputs
         fl = self.final_layer
-        va, vb, lat_t, lat_h, lat_w = extra_ints[0, :5].tolist()
-        assert (extra_ints[:, :5] == extra_ints[0, :5].unsqueeze(0)).all()
-        head_idx = extra_ints[:, 5].long()
+        va, vb, lat_t, lat_h, lat_w = extra_ints[0].tolist()
+        assert (extra_ints == extra_ints[0].unsqueeze(0)).all()
 
         shift, scale = fl.adaln_proj(t_emb)
         target_mod_row = mod_row[:, va:vb]
@@ -683,24 +729,15 @@ class FinalLayer(nn.Module):
         hv = (fl.norm(h[:, va:vb]) * (1.0 + scale.gather(1, gather_idx)) + shift.gather(1, gather_idx)).to(torch.float32)
 
         n = fl.pdd_steps
-        video_dim = fl.video_dim
-        bs = h.shape[0]
-        out = torch.empty(bs, vb - va, video_dim, dtype=torch.float32, device=h.device)
         W = fl.video_out.weight.to(torch.float32)  # (video_dim * n, hidden) head bank; may be float8 on float8 checkpoints
         bias = None if fl.video_out.bias is None else fl.video_out.bias.to(torch.float32)
-        for k in head_idx.unique().tolist():
-            sel = head_idx == k
-            if n == 1:
-                v = F.linear(hv[sel], W, bias)
-            else:
-                # row block 0 is a full head, later blocks are offsets from it
-                Wv = W.view(n, video_dim, -1)
-                Bv = bias.view(n, video_dim) if bias is not None else None
-                k = int(k)
-                Wk = Wv[0] if k == 0 else Wv[0] + Wv[k]
-                Bk = None if Bv is None else (Bv[0] if k == 0 else Bv[0] + Bv[k])
-                v = F.linear(hv[sel], Wk, Bk)
-            out[sel] = v.to(torch.float32)
+        out = F.linear(hv, W, bias)  # (bs, S, video_dim * n), one row block per head
+        if n > 1:
+            # head 0 is the full head at weight 1; offset heads are weighted by their share of the
+            # grid interval containing this example's sigma. On-grid sigmas collapse to a single
+            # offset head at weight 1 (exactly the old per-head selection).
+            pdd_weights = build_pdd_grid_weights(sigma_v.detach(), self.sigma_grid)
+            out = _blend_pdd_heads(out, pdd_weights, n)
 
         vid = unpatchify_video(out, lat_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
         return -vid

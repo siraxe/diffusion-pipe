@@ -271,8 +271,35 @@ class CommonPipeline:
                     target_modules.add(full_submodule_name)
         return list(target_modules)
 
+    def _get_transformer_blocks(self, model):
+        for attr in ('transformer_blocks', 'blocks', 'double_blocks'):
+            blocks = getattr(model, attr, None)
+            if isinstance(blocks, nn.ModuleList) and len(blocks) > 0:
+                return attr, blocks
+        return None, None
+
+    def _apply_skip_alternate_blocks(self, target_model, adapter_config):
+        """Returns an exclude_modules regex that skips every second transformer block, or None."""
+        if not (adapter_config.get('skip_alternate_blocks', False) or self.model_config.get('skip_alternate_blocks', False)):
+            return None
+        attr, blocks = self._get_transformer_blocks(target_model)
+        if blocks is None:
+            print('skip_alternate_blocks: could not find transformer blocks on the model, ignoring')
+            return None
+        num_blocks = len(blocks)
+        excluded = [str(i) for i in range(num_blocks) if i % 2 == 1]
+        block_regex = rf'{attr}\.(?:{"|".join(excluded)})\.'
+        if is_main_process():
+            print(f'skip_alternate_blocks: excluding {len(excluded)} of {num_blocks} {attr} from adapter training')
+        return f'{block_regex}.*'
+
     def configure_adapter(self, target_model, adapter_config):
         target_modules = self.get_target_modules(target_model)
+
+        exclude_modules = adapter_config.get('exclude_modules', None)
+        skip_regex = self._apply_skip_alternate_blocks(target_model, adapter_config)
+        if skip_regex is not None:
+            exclude_modules = skip_regex if exclude_modules is None else f'{exclude_modules}|{skip_regex}'
 
         adapter_type = adapter_config['type']
         if adapter_type == 'lora':
@@ -282,7 +309,7 @@ class CommonPipeline:
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
                 target_modules=target_modules,
-                exclude_modules=adapter_config.get('exclude_modules', None),
+                exclude_modules=exclude_modules,
             )
         elif adapter_type == 'lokr':
             peft_config = peft.LoKrConfig(
@@ -291,7 +318,7 @@ class CommonPipeline:
                 alpha=adapter_config['alpha'],
                 rank_dropout=adapter_config['rank_dropout'],
                 target_modules=target_modules,
-                exclude_modules=adapter_config.get('exclude_modules', None),
+                exclude_modules=exclude_modules,
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
@@ -681,10 +708,34 @@ class ComfyPipeline(CommonPipeline):
         for name, p in self.diffusion_model.named_parameters():
             p.original_name = name
             p.requires_grad_(True)
+        self._freeze_alternate_blocks_full_finetune(self.diffusion_model)
 
         patched_something = self.patch_quantized_modules(self.diffusion_model)
         if patched_something:
             assert 'adapter' in self.config, 'You are trying to full finetune a quantized model which will not work'
+
+    def _freeze_alternate_blocks_full_finetune(self, model):
+        """For full finetuning: freeze every second transformer block if skip_alternate_blocks is set."""
+        enabled = (
+            self.model_config.get('skip_alternate_blocks', False)
+            or self.config.get('adapter', {}).get('skip_alternate_blocks', False)
+        )
+        if not enabled:
+            return
+        attr, blocks = self._get_transformer_blocks(model)
+        if blocks is None:
+            print('skip_alternate_blocks: could not find transformer blocks on the model, ignoring')
+            return
+        num_blocks = len(blocks)
+        num_trainable = 0
+        for i, block in enumerate(blocks):
+            if i % 2 == 1:
+                for p in block.parameters():
+                    p.requires_grad_(False)
+            else:
+                num_trainable += 1
+        if is_main_process():
+            print(f'skip_alternate_blocks: training {num_trainable} of {num_blocks} {attr} (full finetune, excluded odd indices: 1, 3, ...)')
 
     def get_vae(self):
         return self.vae
